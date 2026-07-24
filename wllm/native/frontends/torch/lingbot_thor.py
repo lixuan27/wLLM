@@ -95,7 +95,7 @@ class LingbotTorchFrontendThor:
         raise NotImplementedError(
             "LingbotTorchFrontendThor is a scaffold and is not used by the "
             "current runner. Use the low-level "
-            "wllm_native.models.lingbot.graph_runner.sample_actions_graph path "
+            "wllm.native.models.lingbot.graph_runner.sample_actions_graph path "
             "(see examples/lingbot_quickstart.py and docs/lingbot_usage.md)."
         )
 

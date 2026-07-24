@@ -388,7 +388,7 @@ class Cosmos3EdgeTorchFrontendThor:
         )
 
         module = (
-            "wllm_native.models.cosmos3_edge.action_only_official"
+            "wllm.native.models.cosmos3_edge.action_only_official"
             if backend == "official_action_only"
             else "cosmos_framework.scripts.inference"
         )

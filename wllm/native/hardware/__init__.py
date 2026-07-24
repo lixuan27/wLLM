@@ -60,10 +60,16 @@ def detect_arch() -> str:
         return "rtx_sm87"
     if (major, minor) == (8, 9):
         return "rtx_sm89"
+    if (major, minor) == (9, 0):
+        # Hopper (H100/H200): probe tier — routed onto the Ada-class
+        # pipelines (FP8 via cuBLASLt + portable attention); NVFP4 paths
+        # remain Blackwell-only.
+        return "hopper_sm90"
     raise RuntimeError(
         f"wLLM: unsupported GPU SM {major}.{minor}. "
         f"Supported architectures: SM110 (Thor), SM120/SM121 (Blackwell), "
-        f"SM89 (RTX 4090), SM87 (Jetson Orin experimental)."
+        f"SM90 (Hopper, probe tier), SM89 (RTX 4090), "
+        f"SM87 (Jetson Orin experimental)."
     )
 
 
@@ -74,64 +80,66 @@ def detect_arch() -> str:
 _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     # ── Pi0.5 ──
     ("pi05", "torch", "thor"):
-        ("wllm_native.frontends.torch.pi05_thor", "Pi05TorchFrontendThor"),
+        ("wllm.native.frontends.torch.pi05_thor", "Pi05TorchFrontendThor"),
     ("pi05", "torch", "rtx_sm120"):
-        ("wllm_native.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
+        ("wllm.native.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "torch", "rtx_sm87"):
-        ("wllm_native.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
+        ("wllm.native.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "torch", "rtx_sm89"):
-        ("wllm_native.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
+        ("wllm.native.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
+    ("pi05", "torch", "hopper_sm90"):
+        ("wllm.native.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "jax", "thor"):
-        ("wllm_native.frontends.jax.pi05_thor", "Pi05JaxFrontendThor"),
+        ("wllm.native.frontends.jax.pi05_thor", "Pi05JaxFrontendThor"),
     ("pi05", "jax", "rtx_sm120"):
-        ("wllm_native.frontends.jax.pi05_rtx", "Pi05JaxFrontendRtx"),
+        ("wllm.native.frontends.jax.pi05_rtx", "Pi05JaxFrontendRtx"),
     ("pi05", "jax", "rtx_sm89"):
-        ("wllm_native.frontends.jax.pi05_rtx", "Pi05JaxFrontendRtx"),
+        ("wllm.native.frontends.jax.pi05_rtx", "Pi05JaxFrontendRtx"),
 
     # ── Pi0 ── (Thor native + RTX consumer via pipeline_rtx.py.)
     ("pi0", "torch", "thor"):
-        ("wllm_native.frontends.torch.pi0_thor", "Pi0TorchFrontendThor"),
+        ("wllm.native.frontends.torch.pi0_thor", "Pi0TorchFrontendThor"),
     ("pi0", "torch", "rtx_sm120"):
-        ("wllm_native.frontends.torch.pi0_rtx", "Pi0TorchFrontendRtx"),
+        ("wllm.native.frontends.torch.pi0_rtx", "Pi0TorchFrontendRtx"),
     ("pi0", "torch", "rtx_sm89"):
-        ("wllm_native.frontends.torch.pi0_rtx", "Pi0TorchFrontendRtx"),
+        ("wllm.native.frontends.torch.pi0_rtx", "Pi0TorchFrontendRtx"),
     ("pi0", "jax", "thor"):
-        ("wllm_native.frontends.jax.pi0_thor", "Pi0JaxFrontendThor"),
+        ("wllm.native.frontends.jax.pi0_thor", "Pi0JaxFrontendThor"),
     ("pi0", "jax", "rtx_sm120"):
-        ("wllm_native.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),
+        ("wllm.native.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),
     ("pi0", "jax", "rtx_sm89"):
-        ("wllm_native.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),
+        ("wllm.native.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),
 
     # ── GROOT N1.6 ──
     ("groot", "torch", "thor"):
-        ("wllm_native.frontends.torch.groot_thor", "GrootTorchFrontendThor"),
+        ("wllm.native.frontends.torch.groot_thor", "GrootTorchFrontendThor"),
     ("groot", "torch", "rtx_sm120"):
-        ("wllm_native.frontends.torch.groot_rtx", "GrootTorchFrontendRtx"),
+        ("wllm.native.frontends.torch.groot_rtx", "GrootTorchFrontendRtx"),
 
     # ── GROOT N1.7 ──
     ("groot_n17", "torch", "thor"):
-        ("wllm_native.frontends.torch.groot_n17_thor_fp8",
+        ("wllm.native.frontends.torch.groot_n17_thor_fp8",
          "GrootN17TorchFrontendThorFP8"),
     ("groot_n17", "torch", "rtx_sm120"):
-        ("wllm_native.frontends.torch.groot_n17_rtx",
+        ("wllm.native.frontends.torch.groot_n17_rtx",
          "GrootN17TorchFrontendRtx"),
     ("groot_n17", "torch", "rtx_sm89"):
-        ("wllm_native.frontends.torch.groot_n17_rtx_sm89",
+        ("wllm.native.frontends.torch.groot_n17_rtx_sm89",
          "GrootN17TorchFrontendRtxSm89"),
 
     # ── Motus (Wan2.2 + Qwen-VL + action/understanding experts) ──
     # RTX 5090 path only for now. Motus uses a bundle-based E2E contract
     # rather than the image-list VLA API used by Pi0/Pi0.5/GROOT.
     ("motus", "torch", "rtx_sm120"):
-        ("wllm_native.frontends.torch.motus_rtx", "MotusTorchFrontendRtx"),
+        ("wllm.native.frontends.torch.motus_rtx", "MotusTorchFrontendRtx"),
 
     # ── Wan2.2 TI2V-5B official pipeline baseline ──
     ("wan22_ti2v_5b", "torch", "rtx_sm120"):
-        ("wllm_native.frontends.torch.wan22_rtx", "Wan22TorchFrontendRtx"),
+        ("wllm.native.frontends.torch.wan22_rtx", "Wan22TorchFrontendRtx"),
 
     # ── Cosmos3-Nano text2video FP8 denoise (RTX SM120 only) ──
     ("cosmos3_video", "torch", "rtx_sm120"):
-        ("wllm_native.frontends.torch.cosmos3_video_rtx", "Cosmos3VideoTorchFrontendRtx"),
+        ("wllm.native.frontends.torch.cosmos3_video_rtx", "Cosmos3VideoTorchFrontendRtx"),
 
     # ── Qwen3-VL (multimodal Qwen3-VL-8B, NVFP4 + FP8 paths) ──
     # VLM with chat-style API (generate(messages) -> str), not VLA
@@ -141,14 +149,14 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     # the frontend exposes a chat-style VLM surface rather than VLAModel.
     # See docs/qwen3_vl_nvfp4.md and docs/qwen3_vl_fp8_sm89.md.
     ("qwen3_vl", "torch", "rtx_sm120"):
-        ("wllm_native.frontends.torch.qwen3_vl_rtx", "Qwen3VlTorchFrontendRtx"),
+        ("wllm.native.frontends.torch.qwen3_vl_rtx", "Qwen3VlTorchFrontendRtx"),
     ("qwen3_vl", "torch", "rtx_sm89"):
-        ("wllm_native.frontends.torch.qwen3_vl_fp8_sm89_multimodal",
+        ("wllm.native.frontends.torch.qwen3_vl_fp8_sm89_multimodal",
          "Qwen3VlFp8Sm89Frontend"),
 
     # Cosmos3-Edge official Thor baseline.
     ("cosmos3_edge", "torch", "thor"):
-        ("wllm_native.frontends.torch.cosmos3_edge_thor", "Cosmos3EdgeTorchFrontendThor"),
+        ("wllm.native.frontends.torch.cosmos3_edge_thor", "Cosmos3EdgeTorchFrontendThor"),
 
     # ── Nex-N2-mini / Qwen3.6-35B-A3B (qwen3_5_moe) ──
     # Text LLM, not a VLA: GDN linear-attn + full-attn-every-4th + 256-expert
@@ -159,17 +167,17 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     # API, so it is used via direct instantiation of Nexn2TorchFrontendRtx
     # (see docs/nexn2_usage.md) rather than load_model's VLAModel wrapper.
     ("nexn2", "torch", "rtx_sm120"):
-        ("wllm_native.frontends.torch.nexn2_rtx", "Nexn2TorchFrontendRtx"),
+        ("wllm.native.frontends.torch.nexn2_rtx", "Nexn2TorchFrontendRtx"),
 
     # ── Pi0-FAST ── (SM120 runtime fork inside pipeline, no AttentionBackend protocol.)
     ("pi0fast", "torch", "thor"):
-        ("wllm_native.frontends.torch.pi0fast", "Pi0FastTorchFrontend"),
+        ("wllm.native.frontends.torch.pi0fast", "Pi0FastTorchFrontend"),
     ("pi0fast", "torch", "rtx_sm120"):
-        ("wllm_native.frontends.torch.pi0fast", "Pi0FastTorchFrontend"),
+        ("wllm.native.frontends.torch.pi0fast", "Pi0FastTorchFrontend"),
     ("pi0fast", "jax", "thor"):
-        ("wllm_native.frontends.jax.pi0fast", "Pi0FastJaxFrontend"),
+        ("wllm.native.frontends.jax.pi0fast", "Pi0FastJaxFrontend"),
     ("pi0fast", "jax", "rtx_sm120"):
-        ("wllm_native.frontends.jax.pi0fast", "Pi0FastJaxFrontend"),
+        ("wllm.native.frontends.jax.pi0fast", "Pi0FastJaxFrontend"),
 }
 
 

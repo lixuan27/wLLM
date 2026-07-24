@@ -1,1 +1,1 @@
-"""wllm_native.utils — shared helpers (tokenizer resolution, etc.)."""
+"""wllm.native.utils — shared helpers (tokenizer resolution, etc.)."""
