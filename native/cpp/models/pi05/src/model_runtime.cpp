@@ -1,0 +1,583 @@
+/* model_runtime.cpp — Pi0.5 behind the generic model-runtime face. */
+#include "wllmrt/cpp/models/pi05/model_runtime.h"
+
+#include "config_map.h"
+
+#include <cstring>
+#include <cstdint>
+#include <memory>
+#include <new>
+#include <string>
+#include <vector>
+
+namespace {
+
+using wllm::modalities::Status;
+using wllm::models::pi05::cface::status_code;
+
+/* Port indices — fixed for the Pi0.5 face (array order below). No prompt
+ * port on the adopted-export path: the prompt embedding is baked before
+ * capture and cannot be updated, so declaring it would be an
+ * advertise-and-refuse STAGED port. The native tokenizer producer adds it
+ * back as a real STAGED port (a fingerprint change, as it should be). */
+enum { kPortImages = 0, kPortNoise = 1, kPortActions = 2 };
+constexpr uint32_t kNoPort = UINT32_MAX;
+
+struct Adapter {
+    std::unique_ptr<wllm::models::pi05::Runtime> runtime;
+    std::string last_error;
+    std::vector<std::string> view_order;
+    const wrt_model_runtime_v1* source_model = nullptr;
+    uint32_t images_port = kPortImages;
+    uint32_t noise_port = kPortNoise;
+    uint32_t actions_port = kPortActions;
+    uint32_t prompt_port = kNoPort;
+    uint32_t state_port = kNoPort;
+    bool has_prompt_text = false;
+    bool has_state = false;
+    std::size_t prompt_text_limit = 0;
+    std::string prompt_text;
+    std::vector<float> state_values;
+    std::vector<wllm::modalities::VisionFrame> vision_frames;
+    std::vector<float> action_values;
+
+    int64_t image_shape[4] = {0, 0, 0, 3};
+    int64_t noise_shape[2] = {0, 0};
+    int64_t action_shape[2] = {0, 0};
+};
+
+uint32_t rt_dtype(wllm::modalities::DType d) {
+    using wllm::modalities::DType;
+    switch (d) {
+        case DType::kUInt8: return WRT_RT_DTYPE_U8;
+        case DType::kFloat32: return WRT_RT_DTYPE_F32;
+        case DType::kFloat16: return WRT_RT_DTYPE_F16;
+        case DType::kBFloat16: return WRT_RT_DTYPE_BF16;
+    }
+    return WRT_RT_DTYPE_BF16;
+}
+
+wllm::modalities::DType model_dtype(uint32_t d) {
+    using wllm::modalities::DType;
+    switch (d) {
+        case WRT_RT_DTYPE_U8: return DType::kUInt8;
+        case WRT_RT_DTYPE_F32: return DType::kFloat32;
+        case WRT_RT_DTYPE_F16: return DType::kFloat16;
+        case WRT_RT_DTYPE_BF16:
+        default: return DType::kBFloat16;
+    }
+}
+
+wllm::modalities::Layout model_layout(uint32_t l) {
+    using wllm::modalities::Layout;
+    switch (l) {
+        case WRT_RT_LAYOUT_HWC: return Layout::kHWC;
+        case WRT_RT_LAYOUT_NHWC: return Layout::kNHWC;
+        case WRT_RT_LAYOUT_CHW: return Layout::kCHW;
+        case WRT_RT_LAYOUT_NCHW: return Layout::kNCHW;
+        case WRT_RT_LAYOUT_FLAT:
+        default: return Layout::kFlat;
+    }
+}
+
+wllm::modalities::TensorView tensor_from_port(
+        const wrt_runtime_port_desc& p) {
+    wllm::modalities::TensorView view;
+    if (!p.buffer) return view;
+    auto* base = static_cast<unsigned char*>(wrt_buffer_dptr(p.buffer));
+    if (!base) return view;
+    const uint64_t total = wrt_buffer_bytes(p.buffer);
+    if (p.offset > total) return view;
+    if (p.bytes && p.bytes > total - p.offset) return view;
+    view.data = base + p.offset;
+    view.bytes = p.bytes ? p.bytes : (total - p.offset);
+    view.dtype = model_dtype(p.dtype);
+    view.place = wllm::modalities::MemoryPlace::kDevice;
+    view.layout = model_layout(p.layout);
+    view.shape.rank = p.rank > wllm::modalities::Shape::kMaxRank
+                          ? wllm::modalities::Shape::kMaxRank
+                          : p.rank;
+    for (uint32_t i = 0; i < view.shape.rank; ++i) {
+        view.shape.dims[i] = p.shape[i] > 0 ? static_cast<uint64_t>(p.shape[i])
+                                            : 0;
+    }
+    return view;
+}
+
+wllm::modalities::PixelFormat view_pixel_format(uint32_t value) {
+    using wllm::modalities::PixelFormat;
+    switch (value) {
+        case WRT_RT_PIXEL_BGR8: return PixelFormat::kBGR8;
+        case WRT_RT_PIXEL_RGBA8: return PixelFormat::kRGBA8;
+        case WRT_RT_PIXEL_BGRA8: return PixelFormat::kBGRA8;
+        case WRT_RT_PIXEL_GRAY8: return PixelFormat::kGRAY8;
+        case WRT_RT_PIXEL_RGB8:
+        default: return PixelFormat::kRGB8;
+    }
+}
+
+int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
+              int stream) {
+    (void)stream;  /* the pi05 runtime stages on the export's graph stream */
+    auto* a = static_cast<Adapter*>(self);
+    if (!a || !a->runtime) return -1;
+    if (port == a->images_port) {
+            if (!data || !bytes || bytes % sizeof(wrt_image_view)) {
+                a->last_error = "images payload must be wrt_image_view[]";
+                return -1;
+            }
+            const auto* views = static_cast<const wrt_image_view*>(data);
+            const uint64_t n = bytes / sizeof(wrt_image_view);
+            if (n != a->vision_frames.size()) {
+                a->last_error = "image view count does not match the runtime";
+                return -4;
+            }
+            for (uint64_t i = 0; i < n; ++i) {
+                const wrt_image_view& in = views[i];
+                if (in.struct_size < sizeof(wrt_image_view) || !in.data) {
+                    a->last_error = "invalid image view";
+                    return -1;
+                }
+                if (in.pixel_format > WRT_RT_PIXEL_GRAY8) {
+                    a->last_error = "image pixel format is invalid";
+                    return -4;
+                }
+                auto& f = a->vision_frames[static_cast<std::size_t>(i)];
+                f.image.data = const_cast<void*>(in.data);
+                f.image.bytes = in.bytes;
+                f.image.dtype = wllm::modalities::DType::kUInt8;
+                f.image.place = wllm::modalities::MemoryPlace::kHost;
+                f.image.layout = wllm::modalities::Layout::kHWC;
+                f.image.shape = wllm::modalities::Shape{
+                    static_cast<uint64_t>(in.height > 0 ? in.height : 0),
+                    static_cast<uint64_t>(in.width > 0 ? in.width : 0), 3};
+                f.format = view_pixel_format(in.pixel_format);
+                f.width = in.width;
+                f.height = in.height;
+                f.stride_bytes = in.stride_bytes;
+                f.timestamp_ns = in.timestamp_ns;
+            }
+            Status st = a->runtime->prepare_vision(a->vision_frames);
+            if (!st.ok_status()) {
+                a->last_error = st.message;
+                return status_code(st);
+            }
+            a->last_error.clear();
+            return 0;
+    }
+    if (port == a->noise_port) {
+        a->last_error =
+            "noise is a SWAP port: write its buffer window directly";
+        return -3;
+    }
+    if (port == a->prompt_port) {
+        if (!data && bytes) {
+            a->last_error = "prompt payload is null";
+            return -1;
+        }
+        if (bytes > a->prompt_text_limit) {
+            a->last_error = "prompt payload exceeds the hot-path capacity";
+            return -4;
+        }
+        const char* begin = static_cast<const char*>(data);
+        if (bytes) {
+            a->prompt_text.assign(begin, begin + bytes);
+        } else {
+            a->prompt_text.clear();
+        }
+        a->has_prompt_text = true;
+        const int rc = a->has_state
+                           ? a->runtime->set_prompt_state(
+                                 a->prompt_text.c_str(),
+                                 a->state_values.data(),
+                                 a->state_values.size())
+                           : a->runtime->set_prompt(a->prompt_text.c_str());
+        if (rc != 0) {
+            const auto& st = a->runtime->prompt_status();
+            a->last_error = st.message.empty()
+                                ? "prompt staging is not configured"
+                                : st.message;
+            return status_code(st);
+        }
+        a->last_error.clear();
+        return 0;
+    }
+    if (port == a->state_port) {
+        if (!data || !bytes || bytes % sizeof(float)) {
+            a->last_error = "state payload must be f32[]";
+            return -1;
+        }
+        const uint64_t n = bytes / sizeof(float);
+        if (n != a->state_values.size()) {
+            a->last_error = "state dimension does not match the runtime";
+            return -4;
+        }
+        const auto* values = static_cast<const float*>(data);
+        std::memcpy(a->state_values.data(), values,
+                    static_cast<std::size_t>(bytes));
+        a->has_state = true;
+        if (!a->has_prompt_text) {
+            a->last_error.clear();
+            return 0;
+        }
+        const int rc = a->runtime->set_prompt_state(
+            a->prompt_text.c_str(), a->state_values.data(),
+            a->state_values.size());
+        if (rc != 0) {
+            const auto& st = a->runtime->prompt_status();
+            a->last_error = st.message.empty()
+                                ? "state staging failed"
+                                : st.message;
+            return status_code(st);
+        }
+        a->last_error.clear();
+        return 0;
+    }
+    a->last_error = "unknown or non-input port";
+    return -1;
+}
+
+int get_output(void* self, uint32_t port, void* out, uint64_t capacity,
+               uint64_t* written, int stream) {
+    (void)stream;
+    auto* a = static_cast<Adapter*>(self);
+    if (!a || !a->runtime || !out) return -1;
+    if (port != a->actions_port) {
+        a->last_error = "unknown or non-output port";
+        return -1;
+    }
+    Status st = a->runtime->read_actions(&a->action_values);
+    if (!st.ok_status()) {
+        a->last_error = st.message;
+        return status_code(st);
+    }
+    const uint64_t need = a->action_values.size() * sizeof(float);
+    if (written) *written = need;
+    if (capacity < need) {
+        a->last_error = "action output buffer is too small";
+        return -5;
+    }
+    std::memcpy(out, a->action_values.data(), need);
+    a->last_error.clear();
+    return 0;
+}
+
+int prepare(void* self, uint32_t graph, wrt_shape_key key) {
+    auto* a = static_cast<Adapter*>(self);
+    if (!a) return -1;
+    if (!a->source_model || !a->source_model->exp) {
+        a->last_error = "Pi05 fixed graph variants are captured at setup";
+        return -3;
+    }
+    const wrt_runtime_export_v1* exp = a->source_model->exp;
+    if (graph >= exp->n_graphs) {
+        a->last_error = "Pi05 prepare graph index is out of range";
+        return -2;
+    }
+    if (!wrt_graph_has_variant(exp->graphs[graph].handle, key)) {
+        a->last_error = "Pi05 fixed graph variant was not captured";
+        return -2;
+    }
+    a->last_error.clear();
+    return 0;
+}
+
+int step(void* self) {
+    auto* a = static_cast<Adapter*>(self);
+    if (!a || !a->runtime) return -1;
+    if (a->source_model) {
+        const wrt_model_runtime_v1* m = a->source_model;
+        const wrt_runtime_export_v1* exp = m->exp;
+        if (!exp || (!exp->graphs && exp->n_graphs)) return -1;
+        for (uint64_t i = 0; i < m->n_stages; ++i) {
+            const auto& stage = m->stages[i];
+            if (stage.graph >= exp->n_graphs) {
+                a->last_error = "Pi05 stage references a missing graph";
+                return -1;
+            }
+            const int stream_id = exp->graphs[stage.graph].stream_id;
+            for (uint32_t d = 0; d < stage.n_after; ++d) {
+                const uint32_t dep = stage.after[d];
+                if (dep >= i || m->stages[dep].graph >= exp->n_graphs) {
+                    a->last_error = "Pi05 stage dependency is invalid";
+                    return -1;
+                }
+                if (exp->graphs[m->stages[dep].graph].stream_id != stream_id) {
+                    a->last_error =
+                        "cross-stream stage DAG requires a host scheduler";
+                    return -3;
+                }
+            }
+            const auto& graph = exp->graphs[stage.graph];
+            if (!graph.handle) {
+                a->last_error = "Pi05 stage graph has no handle";
+                return -1;
+            }
+            const int rc = wrt_graph_replay(graph.handle, graph.default_key,
+                                            stream_id);
+            if (rc != 0) {
+                a->last_error = "Pi05 stage replay failed";
+                return rc;
+            }
+        }
+        a->last_error.clear();
+        return 0;
+    }
+    int rc = a->runtime->replay_tick();
+    if (rc != 0) a->last_error = "Pi05 graph replay failed";
+    return rc;
+}
+
+const char* last_error(void* self) {
+    auto* a = static_cast<Adapter*>(self);
+    return a ? a->last_error.c_str() : "null Pi05 model runtime";
+}
+
+void destroy_adapter(void* p) { delete static_cast<Adapter*>(p); }
+
+const wrt_runtime_buffer_desc* find_buffer(const wrt_runtime_export_v1* exp,
+                                           const std::string& name) {
+    for (uint64_t i = 0; i < exp->n_buffers; ++i)
+        if (exp->buffers[i].name && name == exp->buffers[i].name)
+            return &exp->buffers[i];
+    return nullptr;
+}
+
+const wrt_runtime_graph_desc* graph_for_first_stage(
+        const wrt_model_runtime_v1* model) {
+    if (!model || !model->exp || !model->n_stages) return nullptr;
+    const uint32_t graph = model->stages[0].graph;
+    if (graph >= model->exp->n_graphs) return nullptr;
+    return &model->exp->graphs[graph];
+}
+
+uint32_t find_port_index(const wrt_model_runtime_v1* model,
+                         const char* name) {
+    if (!model || !name) return kNoPort;
+    for (uint64_t i = 0; i < model->n_ports; ++i) {
+        const char* n = model->ports[i].name;
+        if (n && std::strcmp(n, name) == 0) return static_cast<uint32_t>(i);
+    }
+    return kNoPort;
+}
+
+bool compatible_port(const wrt_model_runtime_v1* model, uint32_t port,
+                     uint32_t modality, uint32_t direction,
+                     uint32_t update) {
+    if (!model || port == kNoPort || port >= model->n_ports) return false;
+    const auto& p = model->ports[port];
+    return p.modality == modality && p.direction == direction &&
+           p.update == update;
+}
+
+}  // namespace
+
+extern "C" int wrt_pi05_model_runtime_create(
+        const wrt_runtime_export_v1* exp,
+        const wrt_pi05_runtime_config* config,
+        wrt_model_runtime_v1** out) {
+    if (!exp || !out) return -1;
+    *out = nullptr;
+    constexpr std::size_t kConfigRequiredSize =
+        offsetof(wrt_pi05_runtime_config, image_dtype);
+    if (config && config->struct_size < kConfigRequiredSize) return -1;
+
+    auto a = std::unique_ptr<Adapter>(new (std::nothrow) Adapter());
+    if (!a) return -5;
+    a->runtime.reset(new (std::nothrow) wllm::models::pi05::Runtime(
+        exp, wllm::models::pi05::cface::make_config(config)));
+    if (!a->runtime) return -5;
+    if (!a->runtime->ok()) return status_code(a->runtime->status());
+
+    const auto& manifest = a->runtime->manifest();
+    a->view_order = manifest.vision.view_order;
+    a->vision_frames.resize(a->view_order.size());
+    for (std::size_t i = 0; i < a->view_order.size(); ++i) {
+        a->vision_frames[i].name = a->view_order[i];
+    }
+    a->action_values.resize(static_cast<std::size_t>(
+        manifest.action.chunk * manifest.action.robot_dim));
+    a->image_shape[0] = static_cast<int64_t>(a->view_order.size());
+    a->image_shape[1] = manifest.vision.target_height;
+    a->image_shape[2] = manifest.vision.target_width;
+    a->noise_shape[0] = manifest.action.chunk;
+    a->noise_shape[1] = manifest.action.model_dim;
+    a->action_shape[0] = manifest.action.chunk;
+    a->action_shape[1] = manifest.action.robot_dim;
+
+    const std::string image_name = config && config->image_buffer_name
+                                       ? config->image_buffer_name
+                                       : "observation_images_normalized";
+    const std::string action_name = config && config->action_buffer_name
+                                        ? config->action_buffer_name
+                                        : "diffusion_noise";
+    const wrt_runtime_buffer_desc* image_buf = find_buffer(exp, image_name);
+    const wrt_runtime_buffer_desc* action_buf = find_buffer(exp, action_name);
+    const uint32_t io_dtype = rt_dtype(manifest.vision.output_dtype);
+
+    wrt_runtime_port_desc ports[3] = {};
+    ports[kPortImages] = {"images", WRT_RT_MOD_IMAGE, io_dtype,
+                          WRT_RT_LAYOUT_NHWC, WRT_RT_PORT_IN,
+                          WRT_RT_PORT_STAGED, 1, a->image_shape, 4, 30,
+                          image_buf ? image_buf->handle : nullptr, 0,
+                          image_buf ? image_buf->bytes : 0};
+    ports[kPortNoise] = {"noise", WRT_RT_MOD_TENSOR, io_dtype,
+                         WRT_RT_LAYOUT_FLAT, WRT_RT_PORT_IN,
+                         WRT_RT_PORT_SWAP, 0, a->noise_shape, 2, 0,
+                         action_buf ? action_buf->handle : nullptr, 0,
+                         action_buf ? action_buf->bytes : 0};
+    ports[kPortActions] = {"actions", WRT_RT_MOD_ACTION, WRT_RT_DTYPE_F32,
+                           WRT_RT_LAYOUT_FLAT, WRT_RT_PORT_OUT,
+                           WRT_RT_PORT_STAGED, 0, a->action_shape, 2, 0,
+                           nullptr, 0,
+                           static_cast<uint64_t>(manifest.action.chunk) *
+                               manifest.action.robot_dim * sizeof(float)};
+
+    const std::string graph_name =
+        config && config->graph_name ? config->graph_name : "infer";
+    uint32_t graph_index = 0;
+    bool found = false;
+    for (uint64_t i = 0; i < exp->n_graphs; ++i) {
+        if (exp->graphs[i].name && graph_name == exp->graphs[i].name) {
+            graph_index = static_cast<uint32_t>(i);
+            found = true;
+            break;
+        }
+    }
+    if (!found) return -2;
+    wrt_runtime_stage_desc stages[1] = {};
+    stages[0].graph = graph_index;
+
+    wrt_model_runtime_verbs verbs{};
+    verbs.struct_size = sizeof(verbs);
+    verbs.set_input = set_input;
+    verbs.get_output = get_output;
+    verbs.prepare = prepare;
+    verbs.step = step;
+    verbs.last_error = last_error;
+
+    Adapter* raw = a.release();
+    wrt_model_runtime_v1* m = wrt_model_runtime_wrap(
+        exp, ports, 3, stages, 1, &verbs, raw, raw, destroy_adapter);
+    if (!m) {
+        delete raw;
+        return -1;
+    }
+    *out = m;
+    return 0;
+}
+
+extern "C" int wrt_pi05_model_runtime_create_over(
+        const wrt_model_runtime_v1* model,
+        const wrt_pi05_runtime_config* config,
+        wrt_model_runtime_v1** out) {
+    if (!model || !out) return -1;
+    *out = nullptr;
+    if (model->abi_version != WRT_MODEL_RUNTIME_ABI_VERSION ||
+        model->struct_size < WRT_MODEL_RUNTIME_V1_BASE_SIZE ||
+        !model->exp || !model->retain || !model->release) {
+        return -1;
+    }
+    constexpr std::size_t kConfigRequiredSize =
+        offsetof(wrt_pi05_runtime_config, image_dtype);
+    if (config && config->struct_size < kConfigRequiredSize) return -1;
+
+    const uint32_t images = find_port_index(model, "images");
+    const uint32_t noise = find_port_index(model, "noise");
+    const uint32_t actions = find_port_index(model, "actions");
+    const uint32_t actions_raw = find_port_index(model, "actions_raw");
+    const uint32_t prompt = find_port_index(model, "prompt");
+    const uint32_t state = find_port_index(model, "state");
+    if (!compatible_port(model, images, WRT_RT_MOD_IMAGE, WRT_RT_PORT_IN,
+                         WRT_RT_PORT_STAGED) ||
+        !compatible_port(model, actions, WRT_RT_MOD_ACTION, WRT_RT_PORT_OUT,
+                         WRT_RT_PORT_STAGED) ||
+        model->ports[actions].dtype != WRT_RT_DTYPE_F32) {
+        return -2;
+    }
+    if (noise != kNoPort &&
+        !compatible_port(model, noise, WRT_RT_MOD_TENSOR, WRT_RT_PORT_IN,
+                         WRT_RT_PORT_SWAP)) {
+        return -2;
+    }
+    if (actions_raw != kNoPort &&
+        !compatible_port(model, actions_raw, WRT_RT_MOD_TENSOR,
+                         WRT_RT_PORT_OUT, WRT_RT_PORT_SWAP)) {
+        return -2;
+    }
+    if (prompt != kNoPort &&
+        !compatible_port(model, prompt, WRT_RT_MOD_TEXT, WRT_RT_PORT_IN,
+                         WRT_RT_PORT_STAGED)) {
+        return -2;
+    }
+    if (state != kNoPort &&
+        !compatible_port(model, state, WRT_RT_MOD_STATE, WRT_RT_PORT_IN,
+                         WRT_RT_PORT_STAGED)) {
+        return -2;
+    }
+
+    auto cfg = wllm::models::pi05::cface::make_config(config);
+    if (model->n_stages) {
+        const auto* graph = graph_for_first_stage(model);
+        if (!graph || !graph->name) return -2;
+        cfg.graph_name = graph->name;
+    }
+    cfg.image_input_override = tensor_from_port(model->ports[images]);
+    cfg.action_output_override = tensor_from_port(
+        model->ports[actions_raw != kNoPort ? actions_raw : actions]);
+
+    auto a = std::unique_ptr<Adapter>(new (std::nothrow) Adapter());
+    if (!a) return -5;
+    a->runtime.reset(new (std::nothrow)
+                         wllm::models::pi05::Runtime(model->exp, cfg));
+    if (!a->runtime) return -5;
+    if (!a->runtime->ok()) return status_code(a->runtime->status());
+    if (prompt != kNoPort && !a->runtime->prompt_staging_enabled()) {
+        return -2;
+    }
+    if (state != kNoPort &&
+        (!a->runtime->prompt_staging_enabled() ||
+         !a->runtime->state_normalization_enabled())) {
+        return -2;
+    }
+    a->source_model = model;
+    a->images_port = images;
+    a->noise_port = noise;
+    a->actions_port = actions;
+    a->prompt_port = prompt;
+    a->state_port = state;
+    a->view_order = a->runtime->manifest().vision.view_order;
+    a->vision_frames.resize(a->view_order.size());
+    for (std::size_t i = 0; i < a->view_order.size(); ++i) {
+        a->vision_frames[i].name = a->view_order[i];
+    }
+    const auto& action = a->runtime->manifest().action;
+    a->action_values.resize(static_cast<std::size_t>(action.chunk *
+                                                     action.robot_dim));
+    if (cfg.prompt_max_tokens) {
+        a->prompt_text_limit = static_cast<std::size_t>(
+            cfg.prompt_max_tokens * 8ull);
+        a->prompt_text.reserve(a->prompt_text_limit);
+    }
+    if (state != kNoPort) {
+        a->state_values.resize(cfg.state_q01.size());
+    }
+
+    wrt_model_runtime_verbs verbs{};
+    verbs.struct_size = sizeof(verbs);
+    verbs.set_input = set_input;
+    verbs.get_output = get_output;
+    verbs.prepare = prepare;
+    verbs.step = step;
+    verbs.last_error = last_error;
+
+    Adapter* raw = a.release();
+    wrt_model_runtime_v1* m = wrt_model_runtime_override_verbs(
+        model, &verbs, raw, raw, nullptr, destroy_adapter);
+    if (!m) {
+        delete raw;
+        return -1;
+    }
+    *out = m;
+    return 0;
+}

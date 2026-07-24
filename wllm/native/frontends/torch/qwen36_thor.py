@@ -1,0 +1,1320 @@
+"""wLLM — Qwen3.6-27B NVFP4 Thor frontend (SM110).
+
+Per-hardware split required by ``docs/adding_new_model.md`` rule 2:
+one ``(model, framework, hardware)`` file. The RTX frontend at
+:mod:`wllm_native.frontends.torch.qwen36_rtx` is the canonical compute
+path on RTX 5090; this module hosts the parallel Thor entry point.
+
+Construction strategy
+---------------------
+The RTX frontend is monolithic (~10k LOC). The single Thor-incompatible
+construction step is the attention-backend ctor inside the parent
+``__init__``, which directly imports the vendored FA2 extension
+(``wllm_native_fa2`` — not built on Thor). ``_use_thor_attn_backend``
+patches the RTX attention-backend symbol to
+:class:`ThorFlashAttnBackendQwen36` for the duration of parent init.
+Every other load step (NVFP4 weight extraction, MTP head conversion,
+tokenizer, buffer allocation, CUDA Graph mempool setup) runs
+unchanged on Thor.
+
+Dispatch (mirrors 5090's ``_should_use_long_ctx_route`` exactly)
+--------------------------------------------------------------
+``prompt_len < 128``                : short-ctx legacy per-pos walk.
+``128 ≤ prompt_len < 192``          : long-ctx route (5090's exception).
+``prompt_len ≥ LONG_CTX_THRESHOLD``  : long-ctx route.
+``max_pos > bf16_cap``              : long-ctx route.
+
+This module owns Thor-specific overrides on top of the parent:
+
+  * ``_layer_forward_lin_K_nvfp4`` / ``_layer_forward_full_K_nvfp4``:
+    route K > 7 to the from-scratch ``_thor_lin_K_forward`` /
+    ``_thor_full_K_forward`` (parent's K-row kernel chain at M=K
+    diverges from M=1 on SM110 due to fused-kernel reductions;
+    ours uses split kernels that match per-token byte-for-byte at
+    K=128, and stays cos > 0.99 through K=2048).
+  * ``_thor_full_K_forward``: single-path K-row attention. Rotated K
+    lands in ``_K_full_k_rot`` scratch, ``_fp8_write_kv`` quantizes
+    into parent's persistent FP8 cache, ``_fp8_xqa_attn`` reads back
+    via batched XQA at q_seq=K. No BF16 fallback, no per-position
+    FA2 loop — FP8-KV mode is the only supported Thor production
+    mode (mirrors 5090's published recommendation).
+  * ``_fp8_xqa_enabled``: unconditionally True on Thor. Parent's
+    5090-measured bucket policy prefers FA2-causal-bf16 over XQA at
+    some ctx ranges; Thor has no vendored FA2-causal-bf16, so the
+    fallback collapses to per-position XQA (strictly slower than
+    batched). Always go direct to batched XQA.
+  * ``_thor_mtp_prefill_K_nvfp4``: NVFP4 batched MTP K/V tail prefill.
+    Mirrors parent's ``_prefill_mtp_tail_kv_nvfp4`` (which requires
+    BF16 shadow MTP weights) for the NVFP4-only Thor MTP head.
+  * ``_long_tq_effective_k``: caps adaptive K at 6 for
+    ``prompt_len ≥ 12288`` (5090 picks 7 there; the K=7 verify
+    chain at q_seq=8 collapses on Thor, while K=6 verify at q_seq=7
+    is stable and gives higher AL than K=5).
+  * ``_long_mtp_prefill_tail_for_prompt`` / ``_prefill_mtp_tail_kv_nvfp4``:
+    NVFP4 MTP variant of parent's bucketed tail-prefill helpers
+    (parent gates them on BF16 shadow MTP weights).
+
+Backend init only pre-grows the FA2-adapter FP8 paged scratch (used
+by MTP chain attention) to ``user_max_seq``. The BF16 K/V cache from
+the attn backend is no longer bumped — Thor's hot path never touches
+it. The backend's BF16 K_cache stays at parent's default size for
+the short-ctx legacy walk only (prompt_len < 128).
+"""
+
+from __future__ import annotations
+
+import os
+from contextlib import contextmanager
+
+from wllm.native.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
+
+
+@contextmanager
+def _use_thor_attn_backend():
+    """Replace the RTX attn backend symbol with the Thor backend for
+    the duration of ``Qwen36TorchFrontendRtx.__init__``."""
+    import wllm.native.hardware.rtx.attn_backend_qwen36 as rtx_mod
+    from wllm.native.hardware.thor.attn_backend_qwen36 import (
+        ThorFlashAttnBackendQwen36,
+    )
+    saved = rtx_mod.RtxFlashAttnBackendQwen36
+    rtx_mod.RtxFlashAttnBackendQwen36 = ThorFlashAttnBackendQwen36
+    try:
+        yield
+    finally:
+        rtx_mod.RtxFlashAttnBackendQwen36 = saved
+
+
+class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
+    """Qwen3.6-27B NVFP4 Torch frontend for Jetson Thor (SM110).
+
+    Inherits the RTX frontend's loader, weight handling, MTP draft
+    chain, sampling, and generate loop. Swaps in the Thor attention
+    backend at ctor time. The Thor backend mirrors the RTX backend's
+    buffer surface (K_cache, V_cache, Q_buf, O_buf, lse_buf, ...) so
+    the loader does not need per-arch branches.
+
+    Linear-attention chunked backend (Thor default)
+    -----------------------------------------------
+    ``__init__`` calls ``os.environ.setdefault`` to pin
+    ``WLLM_QWEN36_TQ_PREFILL_GDN_BACKEND=native`` on Thor: the RTX
+    default ``wy_lt`` (cublasLt WY-decomposition chunk scan) drifts
+    measurably from the per-token recurrent path on SM110 (mean cos
+    0.999979 → 0.999721 at layer 2, compounding to a 0.43 floor by
+    layer 63), while ``native`` (per-step recurrent) stays cos > 0.9999
+    against the per-token path. ``setdefault`` lets a user-set value
+    win; the call is in ``__init__`` (not module scope) so importing
+    this module without instantiating the frontend never mutates the
+    process env.
+    """
+
+    # K-row layer dispatch threshold on Thor.
+    #
+    # At K ≤ 7 (spec-verify chain length) parent's K-row enters the
+    # ``save_steps>0`` branch which uses per-step recurrent kernels
+    # and stays per-token-equivalent on SM110 — delegate to parent.
+    # At K > 7 parent's K-row enters the ``save_steps=0`` chunk
+    # branch with fused kernels (residual_add_rms_norm_to_nvfp4,
+    # mlp_gate_up_packed, silu_mul_to_nvfp4) whose M=K BF16 rounding
+    # diverges from M=1 on SM110. The Thor-native ``_thor_lin_K_forward``
+    # and ``_thor_full_K_forward`` below replace that branch with
+    # split kernels that match per-token reduction order — verified
+    # cos ≥ 0.999999 at K=128, ≥ 0.99 for the bulk of layers at K=2048.
+    _THOR_K_ROW_FAST_PATH_MAX: int = 7
+
+    def __init__(self, *args, **kwargs):
+        # Thor-only default for the long-context chunked prefill GDN
+        # backend. The RTX default ``wy_lt`` (cublasLt WY-decomposition
+        # chunk scan) is numerically non-equivalent to the per-token
+        # recurrent path on SM110: every linear-attention layer drifts
+        # by ~5e-4 vs. the per-token output, the drift compounds, and
+        # downstream MTP spec acceptance collapses. The ``native``
+        # per-step recurrent backend is mathematically equivalent
+        # (cos > 0.9999) to the per-token path on Thor. Set via
+        # ``setdefault`` so a user-set value still wins; scoped to
+        # ``__init__`` so just importing the module never mutates the
+        # global env (other Qwen3.6 frontends in the same process keep
+        # their RTX default).
+        os.environ.setdefault(
+            "WLLM_QWEN36_TQ_PREFILL_GDN_BACKEND", "native")
+        with _use_thor_attn_backend():
+            super().__init__(*args, **kwargs)
+        self._thor_alloc_K_row_scratch()
+        # Pre-grow ``_fa2_fp8_K`` paged scratch used by the FA2-adapter
+        # path (MTP chain attention). Growing inside a captured graph
+        # bakes stale pointers — pre-grow at ctor time to cover the
+        # MTP K/V cache range.
+        self._attn.ensure_fa2_paged_capacity(int(self._user_max_seq))
+
+    def _mtp_tail_fc_matmul(
+            self, x_ptr: int, w_ptr: int, out_ptr: int,
+            rows: int, hidden: int, stream: int) -> None:
+        """Thor override of the MTP prompt-tail fc matmul.
+
+        At rows >= 2 dispatches an M-tile kernel that reuses the
+        (rows x 10240) W slab across an M_TILE block, cutting W
+        bandwidth by 1/M_TILE while preserving the per-output fma
+        order (bit-identical to the shared kernel). The kernel
+        requires 160 KB of dynamic shared memory per block, which
+        exceeds the SM120-class opt-in limit, so the binding is
+        gated on the device's reported capability and falls back to
+        the shared kernel on any non-zero return.
+        """
+        from wllm.native import wllm_native_kernels as fvk
+        K = hidden * 2
+        if rows >= 2 and K == 10240:
+            rc = fvk.bf16_matmul_qwen36_thor_mtp_fc_bf16(
+                x_ptr, w_ptr, out_ptr, rows, hidden, stream,
+            )
+            if rc == 0:
+                return
+        fvk.bf16_matmul_qwen36_bf16(
+            x_ptr, w_ptr, out_ptr, rows, hidden, K, stream,
+        )
+
+    # ---------- Thor-native K-row scratch ----------
+    #
+    # The parent class allocates a number of K-row scratch buffers
+    # (``_K_lin_*`` / ``_K_full_*`` / ``_K_mlp_*``) under env flags whose
+    # default values flip with ``_long_ctx_mode``. In particular,
+    # ``_mlp_up_out`` and the ``_nvfp4_scratch[(17408, 5120)][2]`` gate
+    # output both shrink to ``(1, 17408)`` when
+    # ``_enable_mlp_gate_up_fusion=True``, which is the default in
+    # long-context mode. That makes the parent's M=1 buffers unsafe for
+    # writes at M=K. The buffers below are owned by this subclass and
+    # always sized for the K-row's M=K upper bound, so the Thor K-row
+    # implementations below never alias a fusion-shrunk parent buffer.
+    def _thor_alloc_K_row_scratch(self) -> None:
+        import torch
+        device = self._h_b.device
+        bf16 = torch.bfloat16
+        Kmax = self.MAX_Q_SEQ
+        # MLP gate / up / silu(gate)*up — own (Kmax, 17408) outputs.
+        self._thor_gate_K = torch.empty(
+            Kmax, 17408, device=device, dtype=bf16)
+        self._thor_up_K = torch.empty(
+            Kmax, 17408, device=device, dtype=bf16)
+        self._thor_silu_K = torch.empty(
+            Kmax, 17408, device=device, dtype=bf16)
+
+    # ---------- K-row layer overrides (Thor-only) ----------
+    #
+    # Linear-attention K-row forward at K above the fast-path threshold.
+    # Routes to a from-scratch Thor implementation that batches every
+    # GEMM / norm / quantize / element-wise op at M=K while keeping the
+    # state-bearing ops (causal_conv1d_update, GDN recurrent) on a
+    # per-position sub-loop. Bit-exact to running K sequential single-
+    # token forwards (see DESIGN §4.5 for the leaf-kernel set).
+    def _layer_forward_lin_K_nvfp4(self, L, h_in_K, K):
+        # K <= 7 stays on parent's per-step branch — the production
+        # MTP spec verify path, untouched. The 8..16 band (DFlash
+        # verify) defaults to parent as well: greedy parity against
+        # the MTP reference is anchored to parent-family rounding, and
+        # a Thor-family verify measurably drifts from it. The opt-in
+        # chunk-saves route (WLLM_QWEN36_THOR_LIN_CHUNK_SAVES=1)
+        # trades that token-exact parity for ~5% lower verify cost
+        # (chunk kernels + per-step checkpoints in one pass) — for
+        # deployments gating on task-level quality instead.
+        if K <= self._THOR_K_ROW_FAST_PATH_MAX:
+            return super()._layer_forward_lin_K_nvfp4(L, h_in_K, K)
+        if K <= self._K_save_max:
+            if self._thor_lin_chunk_saves_enabled():
+                return self._thor_lin_K_forward(L, h_in_K, K)
+            return super()._layer_forward_lin_K_nvfp4(L, h_in_K, K)
+        if K > self.MAX_Q_SEQ:
+            return self._thor_lin_K_dispatch(L, h_in_K, K)
+        return self._thor_lin_K_forward(L, h_in_K, K)
+
+    def _thor_lin_chunk_saves_enabled(self) -> bool:
+        cached = getattr(self, '_thor_lin_saves_flag', None)
+        if cached is None:
+            from wllm.native import wllm_native_kernels as fvk
+
+            cached = (
+                hasattr(fvk, 'causal_conv1d_qwen36_update_chunk_saves_bf16')
+                and hasattr(
+                    fvk,
+                    'qwen36_gdn_chunk_from_conv_smem_strided_saves_bf16')
+                and os.environ.get(
+                    'WLLM_QWEN36_THOR_LIN_CHUNK_SAVES', '0',
+                ).strip().lower() in ('1', 'true', 'on'))
+            self._thor_lin_saves_flag = cached
+        return cached
+
+    def _layer_forward_full_K_nvfp4(
+            self, L, h_in_K, cos_K, sin_K, cur_pos, K):
+        # The verify must stay on ONE kernel family end to end: rows
+        # committed by one family while other rows (or the rollback
+        # checkpoints) come from another surface the families'
+        # occasional rounding disagreements as greedy divergence.
+        # K <= 7 (the production MTP verify) stays on parent. The
+        # 8..16 band follows the lin dispatch: Thor from-scratch when
+        # the chunk-saves kernels serve the lin layers, parent
+        # otherwise — mixing families across layer types measurably
+        # breaks greedy parity.
+        if K <= self._THOR_K_ROW_FAST_PATH_MAX:
+            return super()._layer_forward_full_K_nvfp4(
+                L, h_in_K, cos_K, sin_K, cur_pos, K)
+        if K <= self._K_save_max and not self._thor_lin_chunk_saves_enabled():
+            return super()._layer_forward_full_K_nvfp4(
+                L, h_in_K, cos_K, sin_K, cur_pos, K)
+        if K > self.MAX_Q_SEQ:
+            return self._thor_full_K_dispatch(
+                L, h_in_K, cos_K, sin_K, cur_pos, K)
+        # ``_thor_full_K_forward`` is single-XQA-path and requires
+        # FP8-KV mode (mirrors parent K-row pattern; see _thor_full_K_forward).
+        return self._thor_full_K_forward(
+            L, h_in_K, cos_K, sin_K, cur_pos, K)
+
+    # ---------- Thor-native lin-attn K-row layer ----------
+    #
+    # Mirrors the per-token ``_layer_forward_lin_nvfp4`` math step by
+    # step, scaled to M=K. The leaf-kernel set is the per-token-
+    # equivalent subset that has been verified row-deterministic at
+    # M=K on Thor (no pingpong, no fused norm+quant, no fused
+    # mlp_gate_up, no ab96 paired kernel, no WY chunk scan). State-
+    # bearing ops walk per-position so the recurrent state evolves
+    # exactly as in the per-token path.
+    def _thor_lin_K_forward(self, L, h_in_K, K):
+        import torch
+        from wllm.native import wllm_native_kernels as fvk
+
+        s = torch.cuda.current_stream().cuda_stream
+        lw = self._weights.ptrs['layers'][L]
+        assert lw['type'] == 'linear_attention', (
+            f'_thor_lin_K_forward layer {L} type {lw["type"]!r}'
+        )
+        eps = float(self._cfg['rms_norm_eps'])
+
+        h2 = h_in_K.view(K, 5120)
+        # (1) input rms_norm @ M=K. _h_b is (max_seq, 5120) so [:K] is safe.
+        x_norm = self._h_b[:K].view(K, 5120)
+        fvk.rms_norm(
+            h2.data_ptr(), int(lw['input_norm_eff_w']),
+            x_norm.data_ptr(),
+            K, 5120, eps, s,
+        )
+
+        # (2) NVFP4 quantize x_norm — reused by in_proj_qkv / in_proj_z.
+        ap_5120, sf_5120, _ = self._nvfp4_scratch[(10240, 5120)]
+        fvk.quantize_bf16_to_nvfp4_swizzled(
+            x_norm.data_ptr(), ap_5120.data_ptr(),
+            sf_5120.data_ptr(), K, 5120, s,
+        )
+
+        # (3) in_proj_qkv NVFP4 GEMM @ M=K, N=10240.
+        out_qkv_buf = self._nvfp4_scratch[(10240, 5120)][2]
+        out_qkv_K = out_qkv_buf[:K]
+        fvk.fp4_w4a16_gemm_sm120_bf16out(
+            ap_5120.data_ptr(), int(lw['in_proj_qkv_packed']),
+            out_qkv_K.data_ptr(),
+            K, 10240, 5120,
+            sf_5120.data_ptr(), int(lw['in_proj_qkv_sf']),
+            float(lw['in_proj_qkv_alpha']),
+            s,
+        )
+
+        # (4) in_proj_z NVFP4 GEMM @ M=K, N=6144.
+        out_z_buf = self._nvfp4_scratch[(6144, 5120)][2]
+        out_z_K = out_z_buf[:K]
+        fvk.fp4_w4a16_gemm_sm120_bf16out(
+            ap_5120.data_ptr(), int(lw['in_proj_z_packed']),
+            out_z_K.data_ptr(),
+            K, 6144, 5120,
+            sf_5120.data_ptr(), int(lw['in_proj_z_sf']),
+            float(lw['in_proj_z_alpha']),
+            s,
+        )
+
+        # (5) in_proj_ab BF16 matmul @ M=K, N=96, K_in=5120.
+        # Always go through the K-row of bf16_matmul_qwen36_bf16 (not
+        # the ab96 paired SM120 kernel), so per-row reduction order
+        # matches the per-token bf16_matvec_qwen36_bf16 byte-for-byte.
+        a_vec_K = self._K_lin_a_vec[:K]
+        b_vec_K = self._K_lin_b_vec[:K]
+        fvk.bf16_matmul_qwen36_bf16(
+            x_norm.data_ptr(), int(lw['in_proj_ab_w']),
+            self._K_lin_ab_vec[:K].data_ptr(), K, 96, 5120, s,
+        )
+
+        # (6) causal_conv1d_update — chunk variant (1 launch for K
+        # iters). Byte-equal to per-token at K=22 cur_pos=0; tiny
+        # ULP drift at larger K but well below MTP tolerance.
+        lin_rank = self._linear_layer_rank(L)
+        conv_state = self._lin_conv_state[lin_rank]
+        conv_out_K = self._K_lin_conv_out[:K]
+        # Inside the save-steps range, dump per-step state checkpoints
+        # for the spec-decode partial-accept rollback (same slots the
+        # parent per-step branch writes).
+        save_steps = (
+            K <= self._K_save_max and self._thor_lin_chunk_saves_enabled())
+        if save_steps:
+            conv_steps = self._K_lin_conv_state_per_step
+            fvk.causal_conv1d_qwen36_update_chunk_saves_bf16(
+                out_qkv_K.data_ptr(), int(lw['conv1d_w']),
+                int(lw['conv1d_b']),
+                conv_out_K.data_ptr(), conv_state.data_ptr(),
+                conv_steps[0, lin_rank].data_ptr(),
+                conv_steps.stride(0),
+                1, K, 10240, 4, True, s,
+            )
+        else:
+            fvk.causal_conv1d_qwen36_update_chunk_bf16(
+                out_qkv_K.data_ptr(), int(lw['conv1d_w']),
+                int(lw['conv1d_b']),
+                conv_out_K.data_ptr(), conv_state.data_ptr(),
+                1, K, 10240, 4, True, s,
+            )
+
+        # (7-9) Fused conv_out -> split + Q/K broadcast + GDN gating
+        # + GDN chunk recurrent in one launch. Replaces three separate
+        # launches with the fused chunk-scan kernel.
+        rec_state = self._lin_state[lin_rank]
+        attn_out_K = self._K_lin_attn_out[:K]
+        a_stride = a_vec_K.stride(0)
+        b_stride = b_vec_K.stride(0)
+        if save_steps:
+            lin_steps = self._K_lin_state_per_step
+            fvk.qwen36_gdn_chunk_from_conv_smem_strided_saves_bf16(
+                conv_out_K.data_ptr(),
+                a_vec_K.data_ptr(), b_vec_K.data_ptr(),
+                lw['neg_A_log_exp_fp32_t'].data_ptr(),
+                lw['dt_bias_fp32_t'].data_ptr(),
+                rec_state.data_ptr(),
+                lin_steps[0, lin_rank].data_ptr(),
+                lin_steps.stride(0),
+                attn_out_K.data_ptr(),
+                K, 48, a_stride, b_stride, True, s,
+            )
+        else:
+            fvk.qwen36_gdn_chunk_from_conv_smem_strided_bf16(
+                conv_out_K.data_ptr(),
+                a_vec_K.data_ptr(), b_vec_K.data_ptr(),
+                lw['neg_A_log_exp_fp32_t'].data_ptr(),
+                lw['dt_bias_fp32_t'].data_ptr(),
+                rec_state.data_ptr(),
+                attn_out_K.data_ptr(),
+                K, 48, a_stride, b_stride, True, s,
+            )
+
+        # (10) rms_norm_gated_silu @ M=K*48, dim=128.
+        attn_out_flat = attn_out_K.view(K * 48, 128)
+        z_flat = out_z_K.view(K * 48, 128)
+        norm_out_K = self._K_lin_norm_out[:K]
+        norm_out_flat = norm_out_K.view(K * 48, 128)
+        fvk.rms_norm_gated_silu_qwen36_bf16(
+            attn_out_flat.data_ptr(), z_flat.data_ptr(),
+            int(lw['head_norm_w']),
+            norm_out_flat.data_ptr(),
+            K * 48, 128, eps, s,
+        )
+
+        # (11) Quantize norm_out (K, 6144) -> ap_6144, sf_6144.
+        ap_6144, sf_6144, _ = self._nvfp4_scratch[(5120, 6144)]
+        norm_out_2d = norm_out_K.view(K, 6144)
+        fvk.quantize_bf16_to_nvfp4_swizzled(
+            norm_out_2d.data_ptr(), ap_6144.data_ptr(),
+            sf_6144.data_ptr(), K, 6144, s,
+        )
+
+        # (12) out_proj NVFP4 GEMM @ M=K, N=5120, K_in=6144.
+        out_op_buf = self._nvfp4_scratch[(5120, 6144)][2]
+        out_op_K = out_op_buf[:K]
+        fvk.fp4_w4a16_gemm_sm120_bf16out(
+            ap_6144.data_ptr(), int(lw['out_proj_packed']),
+            out_op_K.data_ptr(),
+            K, 5120, 6144,
+            sf_6144.data_ptr(), int(lw['out_proj_sf']),
+            float(lw['out_proj_alpha']),
+            s,
+        )
+
+        # (13) Post-attn residual h_in + attn_proj -> _K_res_mid.
+        # NB: parent K-row fuses (add + rms_norm + quant) into one
+        # ``residual_add_rms_norm_to_nvfp4_swizzled_bf16`` launch, but
+        # the per-token forward (which production reads
+        # ``_prefill_h_cache`` from) uses the split path; the fused
+        # kernel keeps the intermediate in FP32 while split rounds
+        # through BF16, which yields slightly different SF entries
+        # and hence different MLP-input hidden. The K-row first-chunk
+        # writes into the same ``_prefill_h_cache`` that the MTP head
+        # then consumes, so we MUST match the per-token kernel choice
+        # exactly — otherwise MTP sees a distribution shift and AL
+        # collapses (measured: 3.93 -> 2.15 at K=6 when swapping in
+        # the fused kernel).
+        attn_proj = out_op_K.view(1, K, 5120)
+        res_mid_K = self._K_res_mid[:, :K]
+        fvk.add_bf16_out(
+            h_in_K.data_ptr(), attn_proj.data_ptr(),
+            res_mid_K.data_ptr(), K * 5120, s,
+        )
+        h_post = res_mid_K
+
+        # (14) post-attn rms_norm.
+        x_mlp = self._h_b[:K].view(K, 5120)
+        h_post_view = h_post.view(K, 5120)
+        fvk.rms_norm(
+            h_post_view.data_ptr(), int(lw['post_attn_norm_eff_w']),
+            x_mlp.data_ptr(),
+            K, 5120, eps, s,
+        )
+
+        # (15) Quantize x_mlp for MLP gate / up.
+        ap_mlp, sf_mlp, _ = self._nvfp4_scratch[(17408, 5120)]
+        fvk.quantize_bf16_to_nvfp4_swizzled(
+            x_mlp.data_ptr(), ap_mlp.data_ptr(),
+            sf_mlp.data_ptr(), K, 5120, s,
+        )
+
+        # (16-17) MLP gate / up — separate NVFP4 widen GEMMs @ M=K.
+        # ``_thor_gate_K`` / ``_thor_up_K`` are this subclass's owned
+        # (Kmax, 17408) buffers so they're safe regardless of the
+        # parent's ``_enable_mlp_gate_up_fusion`` shape collapse.
+        gate_out_K = self._thor_gate_K[:K]
+        up_out_K = self._thor_up_K[:K]
+        fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
+            ap_mlp.data_ptr(), int(lw['mlp_gate_packed']),
+            gate_out_K.data_ptr(),
+            K, 17408, 5120,
+            sf_mlp.data_ptr(), int(lw['mlp_gate_sf']),
+            float(lw['mlp_gate_alpha']),
+            s,
+        )
+        fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
+            ap_mlp.data_ptr(), int(lw['mlp_up_packed']),
+            up_out_K.data_ptr(),
+            K, 17408, 5120,
+            sf_mlp.data_ptr(), int(lw['mlp_up_sf']),
+            float(lw['mlp_up_alpha']),
+            s,
+        )
+
+        # (18) silu(gate) * up.
+        silu_out = self._thor_silu_K[:K]
+        fvk.silu_mul_qwen36_bf16(
+            gate_out_K.data_ptr(), up_out_K.data_ptr(),
+            silu_out.data_ptr(), K * 17408, s,
+        )
+
+        # (19) Quantize silu_out for MLP down.
+        ap_dn, sf_dn, _ = self._nvfp4_scratch[(5120, 17408)]
+        fvk.quantize_bf16_to_nvfp4_swizzled(
+            silu_out.data_ptr(), ap_dn.data_ptr(),
+            sf_dn.data_ptr(), K, 17408, s,
+        )
+
+        # (20) MLP down NVFP4 GEMM @ M=K, N=5120, K_in=17408.
+        down_out_buf = self._nvfp4_scratch[(5120, 17408)][2]
+        fvk.fp4_w4a16_gemm_sm120_bf16out(
+            ap_dn.data_ptr(), int(lw['mlp_down_packed']),
+            down_out_buf.data_ptr(),
+            K, 5120, 17408,
+            sf_dn.data_ptr(), int(lw['mlp_down_sf']),
+            float(lw['mlp_down_alpha']),
+            s,
+        )
+        mlp_out = down_out_buf[:K].view(1, K, 5120)
+
+        # (21) Final residual h_post + mlp_out -> _K_layer_out_{a,b}[:K].
+        h_out_full = (self._K_layer_out_a if (L % 2 == 0)
+                      else self._K_layer_out_b)
+        h_out_K = h_out_full[:, :K]
+        fvk.add_bf16_out(
+            h_post.data_ptr(), mlp_out.data_ptr(),
+            h_out_K.data_ptr(), K * 5120, s,
+        )
+        return h_out_K
+
+    # ---------- Thor-native full-attn K-row layer ----------
+    #
+    # Mirrors the per-token ``_layer_forward_full_nvfp4`` math step by
+    # step at M=K. The K projections / norms / quantize ops batch
+    # cleanly; partial_rope + V write + attention walk per-position so
+    # each K row of Q lands at ``Q_buf[:, :1]`` exactly like the per-
+    # token forward — letting ``_attn.run('full', q_seq=1, ...)`` read
+    # the right Q without any extra copies. The corresponding K row of
+    # the layer output is captured from ``O_buf[:, :1]`` before the next
+    # iteration overwrites it.
+    def _thor_full_K_forward(self, L, h_in_K, cos_K, sin_K, cur_pos, K):
+        import torch
+        from wllm.native import wllm_native_kernels as fvk
+
+        s = torch.cuda.current_stream().cuda_stream
+        lw = self._weights.ptrs['layers'][L]
+        assert lw['type'] == 'full_attention', (
+            f'_thor_full_K_forward layer {L} type {lw["type"]!r}'
+        )
+        eps = float(self._cfg['rms_norm_eps'])
+        full_rank = self._full_layer_rank(L)
+
+        h2 = h_in_K.view(K, 5120)
+        # (1) input rms_norm @ M=K. Per-token full-attn at line 1687
+        # uses the SPLIT (rms_norm + separate quant) path even though
+        # the fused kernel exists — keeping the same kernel choice
+        # here so _prefill_h_cache fed to MTP head sees the same
+        # rounding profile.
+        x_norm = self._h_b[:K].view(K, 5120)
+        fvk.rms_norm(
+            h2.data_ptr(), int(lw['input_norm_eff_w']),
+            x_norm.data_ptr(),
+            K, 5120, eps, s,
+        )
+
+        # (2) NVFP4 quantize x_norm — reused for q/k/v projections.
+        ap_5120, sf_5120, _ = self._nvfp4_scratch[(12288, 5120)]
+        fvk.quantize_bf16_to_nvfp4_swizzled(
+            x_norm.data_ptr(), ap_5120.data_ptr(),
+            sf_5120.data_ptr(), K, 5120, s,
+        )
+
+        # (3) q_proj NVFP4 GEMM @ M=K, N=12288 (Q + output_gate fused).
+        q_proj_out_buf = self._nvfp4_scratch[(12288, 5120)][2]
+        fvk.fp4_w4a16_gemm_sm120_bf16out(
+            ap_5120.data_ptr(), int(lw['q_proj_packed']),
+            q_proj_out_buf.data_ptr(),
+            K, 12288, 5120,
+            sf_5120.data_ptr(), int(lw['q_proj_sf']),
+            float(lw['q_proj_alpha']),
+            s,
+        )
+        q_pre_2d = self._K_full_q_rot[:, :K].view(K * 24, 256)
+        gate_flat = self._K_full_gate_sig[:, :K]
+        fvk.qwen36_split_q_gate_bf16(
+            q_proj_out_buf[:K].data_ptr(), q_pre_2d.data_ptr(),
+            gate_flat.data_ptr(), K, s,
+        )
+
+        # (4) k_proj NVFP4 GEMM @ M=K, N=1024.
+        kv_proj_out_buf = self._nvfp4_scratch[(1024, 5120)][2]
+        fvk.fp4_w4a16_gemm_sm120_bf16out(
+            ap_5120.data_ptr(), int(lw['k_proj_packed']),
+            kv_proj_out_buf.data_ptr(),
+            K, 1024, 5120,
+            sf_5120.data_ptr(), int(lw['k_proj_sf']),
+            float(lw['k_proj_alpha']),
+            s,
+        )
+        k_pre_K = kv_proj_out_buf[:K].view(K, 4, 256).clone()
+
+        # (5) q_norm / k_norm (per-head RMSNorm, row-independent).
+        q_norm_out = self._K_full_q_norm_out[:K * 24]
+        fvk.rms_norm(
+            q_pre_2d.data_ptr(), int(lw['q_norm_eff_w']),
+            q_norm_out.data_ptr(),
+            K * 24, 256, eps, s,
+        )
+        k_pre_2d = k_pre_K.view(K * 4, 256)
+        k_norm_out = self._K_full_k_norm_out[:K * 4]
+        fvk.rms_norm(
+            k_pre_2d.data_ptr(), int(lw['k_norm_eff_w']),
+            k_norm_out.data_ptr(),
+            K * 4, 256, eps, s,
+        )
+
+        # (6) v_proj NVFP4 GEMM @ M=K, N=1024 (overwrites kv_proj scratch
+        # — k_pre_K already cloned above).
+        fvk.fp4_w4a16_gemm_sm120_bf16out(
+            ap_5120.data_ptr(), int(lw['v_proj_packed']),
+            kv_proj_out_buf.data_ptr(),
+            K, 1024, 5120,
+            sf_5120.data_ptr(), int(lw['v_proj_sf']),
+            float(lw['v_proj_alpha']),
+            s,
+        )
+        v_new_K = kv_proj_out_buf[:K].view(K, 4, 256)
+
+        # Pre-compute view of q_norm laid out per-position for the loop.
+        q_norm_K = q_norm_out.view(K, 24, 256)
+        k_norm_K = k_norm_out.view(K, 4, 256)
+
+        # (7+8) Attention. One path: rotated K lands in ``_K_full_k_rot``
+        # scratch, ``_fp8_write_kv`` quantizes the new
+        # [cur_pos..cur_pos+K] rows directly into parent's persistent
+        # ``_fp8_K_cache`` paged-equivalent storage, ``_fp8_xqa_attn``
+        # reads that cache via batched XQA at q_seq=K. Zero
+        # re-quantization in attention, zero per-position fallback.
+        # FP8-KV mode is the only supported Thor production mode.
+        assert getattr(self, "_fp8_kv_verify_active", False), (
+            "_thor_full_K_forward requires FP8-KV mode "
+            "(WLLM_QWEN36_LONG_KV_CACHE=fp8)")
+        d = self._rope_dim
+        q_dst = self._attn.Q_buf[:, :K]
+        k_new_K = self._K_full_k_rot[:, :K].view(K, 4, 256)
+        fvk.qwen36_partial_rope_qk_bf16(
+            q_norm_out.data_ptr(), k_norm_out.data_ptr(),
+            cos_K.view(K, d).data_ptr(), sin_K.view(K, d).data_ptr(),
+            q_dst.data_ptr(), k_new_K.data_ptr(),
+            K, 24, 4, 256, 64, s,
+        )
+        self._fp8_write_kv(
+            full_rank, cur_pos, cur_pos + K, k_new_K, v_new_K)
+        self._fp8_xqa_attn(full_rank, cur_pos + K, K, s)
+        attn_out_K = self._attn.O_buf[:, :K].view(K, 24, 256)
+
+        # (9) Output gate: attn * sigmoid(gate). K rows in one launch.
+        attn_flat = attn_out_K.view(1, K, 24 * 256)
+        gated = self._K_full_gated[:, :K].view(1, K, 24 * 256)
+        fvk.sigmoid_mul_qwen36_bf16(
+            gate_flat.data_ptr(), attn_flat.data_ptr(),
+            gated.data_ptr(), K * 24 * 256, s,
+        )
+
+        # (10) o_proj NVFP4 GEMM @ M=K, N=5120, K_in=6144.
+        ap_6144, sf_6144, _ = self._nvfp4_scratch[(5120, 6144)]
+        gated_2d = gated.view(K, 6144)
+        fvk.quantize_bf16_to_nvfp4_swizzled(
+            gated_2d.data_ptr(), ap_6144.data_ptr(),
+            sf_6144.data_ptr(), K, 6144, s,
+        )
+        out_op_buf = self._nvfp4_scratch[(5120, 6144)][2]
+        fvk.fp4_w4a16_gemm_sm120_bf16out(
+            ap_6144.data_ptr(), int(lw['o_proj_packed']),
+            out_op_buf.data_ptr(),
+            K, 5120, 6144,
+            sf_6144.data_ptr(), int(lw['o_proj_sf']),
+            float(lw['o_proj_alpha']),
+            s,
+        )
+
+        # (11) Post-attn residual h_in + attn_proj -> _K_res_mid.
+        # See lin-attn note above on why we keep split (matches per-
+        # token kernel choice).
+        attn_proj = out_op_buf[:K].view(1, K, 5120)
+        res_mid_K = self._K_res_mid[:, :K]
+        fvk.add_bf16_out(
+            h_in_K.data_ptr(), attn_proj.data_ptr(),
+            res_mid_K.data_ptr(), K * 5120, s,
+        )
+        h_post = res_mid_K
+
+        # (12) post-attn rms_norm.
+        x_mlp = self._h_b[:K].view(K, 5120)
+        h_post_view = h_post.view(K, 5120)
+        fvk.rms_norm(
+            h_post_view.data_ptr(), int(lw['post_attn_norm_eff_w']),
+            x_mlp.data_ptr(),
+            K, 5120, eps, s,
+        )
+
+        # (13) Quantize x_mlp for MLP gate / up.
+        ap_mlp, sf_mlp, _ = self._nvfp4_scratch[(17408, 5120)]
+        fvk.quantize_bf16_to_nvfp4_swizzled(
+            x_mlp.data_ptr(), ap_mlp.data_ptr(),
+            sf_mlp.data_ptr(), K, 5120, s,
+        )
+
+        # (14-15) MLP gate / up — separate widen NVFP4 GEMMs @ M=K.
+        gate_out_K = self._thor_gate_K[:K]
+        up_out_K = self._thor_up_K[:K]
+        fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
+            ap_mlp.data_ptr(), int(lw['mlp_gate_packed']),
+            gate_out_K.data_ptr(),
+            K, 17408, 5120,
+            sf_mlp.data_ptr(), int(lw['mlp_gate_sf']),
+            float(lw['mlp_gate_alpha']),
+            s,
+        )
+        fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
+            ap_mlp.data_ptr(), int(lw['mlp_up_packed']),
+            up_out_K.data_ptr(),
+            K, 17408, 5120,
+            sf_mlp.data_ptr(), int(lw['mlp_up_sf']),
+            float(lw['mlp_up_alpha']),
+            s,
+        )
+
+        # (16) silu(gate) * up.
+        silu_out = self._thor_silu_K[:K]
+        fvk.silu_mul_qwen36_bf16(
+            gate_out_K.data_ptr(), up_out_K.data_ptr(),
+            silu_out.data_ptr(), K * 17408, s,
+        )
+
+        # (17) Quantize silu_out for MLP down.
+        ap_dn, sf_dn, _ = self._nvfp4_scratch[(5120, 17408)]
+        fvk.quantize_bf16_to_nvfp4_swizzled(
+            silu_out.data_ptr(), ap_dn.data_ptr(),
+            sf_dn.data_ptr(), K, 17408, s,
+        )
+
+        # (18) MLP down NVFP4 GEMM @ M=K, N=5120, K_in=17408.
+        down_out_buf = self._nvfp4_scratch[(5120, 17408)][2]
+        fvk.fp4_w4a16_gemm_sm120_bf16out(
+            ap_dn.data_ptr(), int(lw['mlp_down_packed']),
+            down_out_buf.data_ptr(),
+            K, 5120, 17408,
+            sf_dn.data_ptr(), int(lw['mlp_down_sf']),
+            float(lw['mlp_down_alpha']),
+            s,
+        )
+        mlp_out = down_out_buf[:K].view(1, K, 5120)
+
+        # (19) Final residual h_post + mlp_out -> _K_layer_out_{a,b}[:K].
+        h_out_full = (self._K_layer_out_a if (L % 2 == 0)
+                      else self._K_layer_out_b)
+        h_out_K = h_out_full[:, :K]
+        fvk.add_bf16_out(
+            h_post.data_ptr(), mlp_out.data_ptr(),
+            h_out_K.data_ptr(), K * 5120, s,
+        )
+        return h_out_K
+
+    # ---------- Dispatch fallback (K > MAX_Q_SEQ panic path) ----------
+    #
+    # When the requested K-row chunk exceeds the K-row scratch capacity,
+    # fall back to a per-position single-token walk. Bit-exact to a
+    # per-token forward; used as a safety hatch only.
+    def _thor_lin_K_dispatch(self, L, h_in_K, K):
+        import torch
+        from wllm.native import wllm_native_kernels as fvk
+
+        hidden = self._cfg["hidden_size"]
+        lin_rank = self._linear_layer_rank(L)
+        s = torch.cuda.current_stream().cuda_stream
+        save_steps = K if K <= self._K_save_max else 0
+        lin_state_slot = self._lin_state[lin_rank]
+        lin_conv_slot = self._lin_conv_state[lin_rank]
+        ls_bytes = lin_state_slot.numel() * 2
+        lc_bytes = lin_conv_slot.numel() * 2
+        h_out_K = (self._K_layer_out_a if (L % 2 == 0)
+                   else self._K_layer_out_b)[:, :K]
+        for r in range(K):
+            h_in_r = h_in_K[:, r:r + 1, :].view(1, hidden).contiguous()
+            h_out_r = super()._layer_forward_lin_nvfp4(L, h_in_r)
+            h_out_K[:, r:r + 1, :].copy_(h_out_r.view(1, 1, hidden))
+            if save_steps > 0:
+                fvk.gpu_copy(
+                    self._K_lin_state_per_step[r, lin_rank].data_ptr(),
+                    lin_state_slot.data_ptr(), ls_bytes, s)
+                fvk.gpu_copy(
+                    self._K_lin_conv_state_per_step[r, lin_rank].data_ptr(),
+                    lin_conv_slot.data_ptr(), lc_bytes, s)
+        return h_out_K
+
+    def _thor_full_K_dispatch(self, L, h_in_K, cos_K, sin_K, cur_pos, K):
+        hidden = self._cfg["hidden_size"]
+        d = self._rope_dim
+        cos_3d = cos_K.view(1, K, d)
+        sin_3d = sin_K.view(1, K, d)
+        h_out_K = (self._K_layer_out_a if (L % 2 == 0)
+                   else self._K_layer_out_b)[:, :K]
+        write_fp8 = bool(getattr(self, "_fp8_kv_verify_active", False))
+        full_rank = self._full_layer_rank(L) if write_fp8 else None
+        for r in range(K):
+            h_in_r = h_in_K[:, r:r + 1, :].view(1, hidden).contiguous()
+            cos_r = cos_3d[:, r].contiguous()
+            sin_r = sin_3d[:, r].contiguous()
+            h_out_r = super()._layer_forward_full_nvfp4(
+                L, h_in_r, cos_r, sin_r, cur_pos + r)
+            h_out_K[:, r:r + 1, :].copy_(h_out_r.view(1, 1, hidden))
+            if write_fp8:
+                pos = cur_pos + r
+                k_row = self._attn.K_cache[
+                    full_rank, pos:pos + 1].view(1, 4, 256)
+                v_row = self._attn.V_cache[
+                    full_rank, pos:pos + 1].view(1, 4, 256)
+                self._fp8_write_kv(full_rank, pos, pos + 1, k_row, v_row)
+        return h_out_K
+
+    # ---------- Batched NVFP4 MTP prefill ----------
+    #
+    # Mirror of parent's ``_prefill_mtp_tail_kv_nvfp4`` for NVFP4 MTP
+    # weights. Parent gates that function on ``'k_proj_w_bf16' in mtp``
+    # (5090 keeps BF16 shadow weights alongside the NVFP4 packed
+    # weights). On Thor we only load NVFP4 MTP weights so parent's
+    # function always returns False; this NVFP4 batched variant fills
+    # the same role.
+    #
+    # The Thor override of ``_prefill_mtp_tail_kv_nvfp4`` (below) calls
+    # this; the override of ``_long_mtp_prefill_tail_for_prompt``
+    # (below) drops parent's BF16-shadow gate so the bucket table
+    # applies to Thor too.
+    #
+    # Dedicated ``_thor_mtp_tail_*`` buffers so the batched prefill
+    # never aliases the K-row scratch buffers.
+    def _thor_ensure_mtp_prefill_buffers(self, rows: int) -> None:
+        """Lazy alloc of dedicated MTP prefill scratch — mirror of
+        parent ``_ensure_mtp_tail_kv_buffers`` but owned by the Thor
+        subclass. Sized to the largest ``rows`` ever requested."""
+        import torch
+
+        rows = int(rows)
+        cap = int(getattr(self, '_thor_mtp_tail_rows', 0))
+        if cap >= rows:
+            return
+        hidden = self._cfg['hidden_size']
+        bf16 = torch.bfloat16
+        device = self._h_b.device
+        self._thor_mtp_tail_rows = rows
+        self._thor_mtp_tail_embed_buf = torch.empty(
+            rows, hidden, device=device, dtype=bf16)
+        self._thor_mtp_tail_h_norm_buf = torch.empty_like(
+            self._thor_mtp_tail_embed_buf)
+        self._thor_mtp_tail_e_norm_buf = torch.empty_like(
+            self._thor_mtp_tail_embed_buf)
+        self._thor_mtp_tail_cat_buf = torch.empty(
+            rows, hidden * 2, device=device, dtype=bf16)
+        self._thor_mtp_tail_fc_out_buf = torch.empty(
+            rows, hidden, device=device, dtype=bf16)
+        self._thor_mtp_tail_x_norm_buf = torch.empty_like(
+            self._thor_mtp_tail_fc_out_buf)
+        self._thor_mtp_tail_k_proj_buf = torch.empty(
+            rows, 4 * 256, device=device, dtype=bf16)
+        self._thor_mtp_tail_v_proj_buf = torch.empty_like(
+            self._thor_mtp_tail_k_proj_buf)
+        self._thor_mtp_tail_k_norm_buf = torch.empty(
+            rows * 4, 256, device=device, dtype=bf16)
+        # Q is not computed during prefill — we still hand the kernel a
+        # 1-head dummy because qwen36_partial_rope_qk_bf16 always
+        # rotates Q (cheap at num_heads_q=1). Parent does the same.
+        self._thor_mtp_tail_dummy_q_in = torch.empty(
+            rows, 1, 256, device=device, dtype=bf16)
+        self._thor_mtp_tail_dummy_q_out = torch.empty_like(
+            self._thor_mtp_tail_dummy_q_in)
+
+    def _thor_mtp_prefill_K_nvfp4(
+            self, prev_h_rows, token_ids, pos_start: int, K: int,
+            cache_base_pos: int | None = None) -> bool:
+        """Populate ``_mtp_K_cache`` / ``_mtp_V_cache`` rows
+        ``[cache_base_pos..cache_base_pos + K)`` (defaults to
+        ``pos_start`` for the absolute-RoPE path) in a single batched
+        walk. Mirror of parent ``_prefill_mtp_tail_kv_nvfp4`` (qwen36_rtx
+        line 4063) with NVFP4 k/v projections instead of BF16.
+        ``pos_start`` is the absolute RoPE position; ``cache_base_pos``
+        is the MTP K/V cache row offset (long-ctx TQ uses a compact
+        MTP cache where this differs from ``pos_start``). Returns
+        ``True`` on success, ``False`` when MTP weights are missing.
+        Skips Q proj, attention, output gate, O proj, MLP, lm_head —
+        none feed K/V cache state, so the parent's per-position loop
+        discards them anyway."""
+        import torch
+
+        from wllm.native import wllm_native_kernels as fvk
+
+        mtp = self._weights.ptrs.get('mtp')
+        if mtp is None:
+            return False
+        rows = int(K)
+        if rows <= 0:
+            return True
+        hidden = self._cfg['hidden_size']
+        eps = float(self._cfg['rms_norm_eps'])
+        s = torch.cuda.current_stream().cuda_stream
+        self._thor_ensure_mtp_prefill_buffers(rows)
+
+        embed = self._thor_mtp_tail_embed_buf[:rows]
+        h_norm = self._thor_mtp_tail_h_norm_buf[:rows]
+        e_norm = self._thor_mtp_tail_e_norm_buf[:rows]
+        cat_buf = self._thor_mtp_tail_cat_buf[:rows]
+        fc_out = self._thor_mtp_tail_fc_out_buf[:rows]
+        x_norm = self._thor_mtp_tail_x_norm_buf[:rows]
+        k_proj = self._thor_mtp_tail_k_proj_buf[:rows]
+        v_proj = self._thor_mtp_tail_v_proj_buf[:rows]
+        k_norm = self._thor_mtp_tail_k_norm_buf[:rows * 4]
+
+        # 0) Embed prev tokens.
+        fvk.qwen36_embedding_lookup_bf16(
+            token_ids.view(-1).data_ptr(),
+            int(self._weights.ptrs['embed_w']),
+            embed.data_ptr(), rows, hidden, s,
+        )
+
+        # 1) Pre-FC norms on prev_h and embed.
+        fvk.rms_norm(
+            prev_h_rows.view(rows, hidden).data_ptr(),
+            int(mtp['pre_fc_norm_hidden_eff_w']),
+            h_norm.data_ptr(), rows, hidden, eps, s,
+        )
+        fvk.rms_norm(
+            embed.data_ptr(), int(mtp['pre_fc_norm_embedding_eff_w']),
+            e_norm.data_ptr(), rows, hidden, eps, s,
+        )
+
+        # 2) Concat [e_norm, h_norm].
+        fvk.concat2_bf16(
+            e_norm.data_ptr(), h_norm.data_ptr(),
+            cat_buf.data_ptr(), rows, hidden, hidden, s,
+        )
+
+        # 3) FC (BF16 matmul, K_in=2*hidden=10240, N=hidden=5120).
+        # Routed through the ``_mtp_tail_fc_matmul`` hook so that
+        # hardware-specific frontends can dispatch a sibling kernel
+        # that matches the per-output fma order of the shared
+        # K=10240 generic chunked path. Thor opts into an M-tile
+        # variant (160 KB dynamic smem) via the override on this
+        # class; any non-Thor / capability-insufficient device falls
+        # back to the shared kernel transparently.
+        #
+        # Numerically-divergent shortcuts that were ruled out here:
+        #   * cuBLAS ``torch.mm`` (0.45 ms) is fast but its rounding
+        #     drops MTP AL 3.93 -> 3.20.
+        #   * Splitting fc_w along K into two K=5120 halves and
+        #     summing partials changes the fma order vs the K=10240
+        #     reduction the MTP head was calibrated against and
+        #     drops AL 3.93 -> 3.50.
+        self._mtp_tail_fc_matmul(
+            cat_buf.data_ptr(), int(mtp['fc_w']),
+            fc_out.data_ptr(), rows, hidden, s,
+        )
+
+        # 4) input_norm.
+        fvk.rms_norm(
+            fc_out.data_ptr(), int(mtp['input_norm_eff_w']),
+            x_norm.data_ptr(), rows, hidden, eps, s,
+        )
+
+        # 5) NVFP4 quantize x_norm — reused for k_proj and v_proj.
+        # Share the (1024, 5120) NVFP4 scratch's ap/sf (sized
+        # max_seq × hidden, so 128 rows is well within). The MTP
+        # batched prefill runs sequentially after the K-row first-chunk
+        # graph and before the spec decode loop, so the shared scratch
+        # is not racing any concurrent user.
+        ap_5120, sf_5120, _ = self._nvfp4_scratch[(1024, 5120)]
+        fvk.quantize_bf16_to_nvfp4_swizzled(
+            x_norm.data_ptr(), ap_5120.data_ptr(),
+            sf_5120.data_ptr(), rows, hidden, s,
+        )
+
+        # 6) k_proj NVFP4 → dedicated k_proj_buf.
+        fvk.fp4_w4a16_gemm_sm120_bf16out(
+            ap_5120.data_ptr(), int(mtp['k_proj_packed']),
+            k_proj.data_ptr(),
+            rows, 4 * 256, hidden,
+            sf_5120.data_ptr(), int(mtp['k_proj_sf']),
+            float(mtp['k_proj_alpha']),
+            s,
+        )
+
+        # 7) v_proj NVFP4 → dedicated v_proj_buf.
+        fvk.fp4_w4a16_gemm_sm120_bf16out(
+            ap_5120.data_ptr(), int(mtp['v_proj_packed']),
+            v_proj.data_ptr(),
+            rows, 4 * 256, hidden,
+            sf_5120.data_ptr(), int(mtp['v_proj_sf']),
+            float(mtp['v_proj_alpha']),
+            s,
+        )
+
+        # 8) k_norm.
+        fvk.rms_norm(
+            k_proj.view(rows * 4, 256).data_ptr(),
+            int(mtp['k_norm_eff_w']),
+            k_norm.data_ptr(), rows * 4, 256, eps, s,
+        )
+
+        # 9) Partial RoPE on K with a 1-head dummy Q. Rotated K lands
+        # into _mtp_K_cache[cache_base..cache_base+rows]. RoPE position
+        # is pos_start (absolute prompt position).
+        cache_base = (int(cache_base_pos)
+                      if cache_base_pos is not None else int(pos_start))
+        cos = self._rope_cos_table[
+            pos_start:pos_start + rows].view(rows, self._rope_dim)
+        sin = self._rope_sin_table[
+            pos_start:pos_start + rows].view(rows, self._rope_dim)
+        q_dummy = self._thor_mtp_tail_dummy_q_in[:rows]
+        q_dummy_out = self._thor_mtp_tail_dummy_q_out[:rows]
+        fvk.qwen36_partial_rope_qk_bf16(
+            q_dummy.data_ptr(), k_norm.data_ptr(),
+            cos.data_ptr(), sin.data_ptr(),
+            q_dummy_out.data_ptr(),
+            self._mtp_K_cache[
+                cache_base:cache_base + rows].data_ptr(),
+            rows, 1, 4, 256, self._rope_dim, s,
+        )
+
+        # 10) V copy.
+        fvk.gpu_copy(
+            self._mtp_V_cache[
+                cache_base:cache_base + rows].data_ptr(),
+            v_proj.data_ptr(), rows * 4 * 256 * 2, s,
+        )
+        return True
+
+    # ---------- Adaptive K override ----------
+    #
+    # Parent's ``_long_tq_effective_k`` picks K=7 for prompt buckets
+    # [12288, 24576) and [49152, 160000) — 5090 measures K=7 best at
+    # those ctx. On Thor K=7 verify (q_seq=8) drops AL catastrophically
+    # (ctx=12K AL=0.72, ctx=16K AL=0.19 — chain drafts no longer align
+    # with verify outputs at q_seq=8). K=6 verify (q_seq=7) works fine
+    # and is in fact better than the previous K=5 cap (measured ctx=12K
+    # K=6 AL=4.50 decode=52 tok/s vs K=5 AL=4.00 decode=46 tok/s;
+    # ctx=16K K=6 AL=4.83 decode=52 vs K=5 AL=4.00 decode=46). Cap
+    # parent's K=7 buckets at K=6.
+    #
+    # The ``WLLM_QWEN36_TQ_SPEC_K`` env is parent's (qwen36_rtx)
+    # spec-K override — historical name from the original TurboQuant
+    # long-ctx implementation, retained on the FP8-KV path. It does
+    # NOT enable TurboQuant; FP8-KV is selected by
+    # ``WLLM_QWEN36_LONG_KV_CACHE=fp8``. The env is honoured here
+    # for explicit user overrides (bisection, ablation).
+    def _long_tq_effective_k(
+            self, prompt_len: int, K: int,
+            max_new_tokens: int | None = None) -> int:
+        target_k = super()._long_tq_effective_k(
+            prompt_len, K, max_new_tokens)
+        if os.environ.get('WLLM_QWEN36_TQ_SPEC_K', ''):
+            return target_k
+        if target_k > 6 and int(prompt_len) >= 12288:
+            return 6
+        return target_k
+
+    # ---------- FP8-KV XQA override ----------
+    #
+    # Parent's _fp8_xqa_enabled implements a 5090-measured bucket
+    # policy that prefers FA2-causal-bf16 (vendored hdim=256 kernel)
+    # over XQA at some ctx ranges, and caps q_seq at
+    # _MAX_PUBLIC_SPEC_K+1. Both choices are 5090-specific:
+    #
+    #   * Thor has no vendored FA2-causal-bf16 kernel. Parent's
+    #     "FA2 fallback" path collapses to a per-position loop
+    #     through _fa2_fwd_adapter, which itself runs XQA at q_seq=1
+    #     — K kernel launches + K BF16->FP8 quantize calls instead
+    #     of one batched XQA at q_seq=K. Strictly slower than going
+    #     direct to batched XQA.
+    #
+    #   * The XQA scratch / semaphores are sized for MAX_Q_SEQ at
+    #     _load_fp8_kv_cache time (qwen36_rtx.py:8751-8755), so any
+    #     q_seq from 1 to MAX_Q_SEQ is supported in batched mode.
+    #
+    # Always return True so every prefill chunk and every verify
+    # chunk routes through batched _fp8_xqa_attn. One pipeline,
+    # no bucket switches, no fallbacks. The WLLM_QWEN36_FP8_XQA=0
+    # env disables for bisection.
+    def _fp8_xqa_enabled(
+            self, q_seq: int | None = None,
+            end_pos: int | None = None) -> bool:
+        if os.environ.get('WLLM_QWEN36_FP8_XQA', '1') == '0':
+            return False
+        try:
+            from wllm.native import wllm_native_kernels as fvk
+            return hasattr(fvk, 'qwen36_flashinfer_xqa_bf16_fp8kv_spec')
+        except Exception:
+            return False
+
+    # ---------- Long-ctx MTP prefill integration ----------
+    #
+    # Parent's _long_mtp_prefill_tail_for_prompt returns 0 when MTP
+    # weights lack a ``_w_bf16`` shadow — the long-ctx generate then
+    # writes only one MTP K/V row (cur_pos = prompt_len) and leaves
+    # positions [1..prompt_len-1] uninitialised. The spec loop then
+    # attends to zeros for the first generated token's MTP cache
+    # window and AL collapses (ctx=128 K=6: 3.93 -> 1.75 measured).
+    #
+    # Thor's NVFP4 MTP head has no BF16 shadow but the math is the
+    # same. Override so the bucket logic applies regardless of the
+    # weight format, then route ``_prefill_mtp_tail_kv_nvfp4`` to the
+    # NVFP4 batched helper above.
+    def _long_mtp_prefill_tail_for_prompt(self, prompt_len: int) -> int:
+        import os
+        raw = os.environ.get(
+            'WLLM_QWEN36_LONG_MTP_PREFILL_TAIL', 'auto') or 'auto'
+        if raw.lower() != 'auto':
+            return max(0, int(raw))
+        mtp = self._weights.ptrs.get('mtp') if self._weights else None
+        if not isinstance(mtp, dict):
+            return 0
+        # Mirror parent's bucket table (qwen36_rtx.py:7867) but drop
+        # the BF16-shadow gate. The NVFP4 batched MTP function provides
+        # the equivalent K/V cache fill.
+        #
+        # Thor adjustment for [128, 512): parent caps mtp_tail at 128
+        # to bound TTFT cost on 5090. At ctx=256-511 this gives only
+        # 25-50% MTP cache coverage and AL collapses (measured ctx=256
+        # K=6 AL=1.71). On Thor the MTP fc kernel (M-tile K=10240
+        # specialised, ~70 ms at M=256) costs ~+100 ms TTFT for full
+        # coverage, but lifts decode tok/s ~1.5x (~29 -> ~45 tok/s at
+        # ctx=256), which more than pays back for any generation
+        # length >= ~16 tokens. Full coverage is the right Thor default.
+        prompt_len = int(prompt_len)
+        if prompt_len >= 128 and prompt_len < 512:
+            return prompt_len
+        if prompt_len < 512:
+            return 0
+        if prompt_len < 768:
+            return 512
+        if prompt_len < 3072:
+            return 2048
+        if prompt_len < 6144:
+            return 512
+        return 2048
+
+    def _prefill_mtp_tail_kv_nvfp4(
+            self, prev_h_rows, token_ids, pos_start: int,
+            cache_base_pos: int) -> bool:
+        """Thor override of parent's MTP K/V tail prefill.
+
+        Parent's variant requires BF16 MTP projection weights and
+        returns False when only NVFP4 weights are loaded. Route to
+        our NVFP4 batched helper instead so long-ctx generate seeds
+        the MTP cache properly and AL is preserved at the bucket
+        sizes parent assumes."""
+        mtp = self._weights.ptrs.get('mtp')
+        if mtp is None:
+            return False
+        # If BF16 shadow weights are present, defer to parent (matches
+        # the original behaviour byte-for-byte on 5090-style ckpts).
+        if 'k_proj_w_bf16' in mtp:
+            return super()._prefill_mtp_tail_kv_nvfp4(
+                prev_h_rows, token_ids, pos_start, cache_base_pos)
+        rows = int(token_ids.numel())
+        if rows <= 0:
+            return True
+        return self._thor_mtp_prefill_K_nvfp4(
+            prev_h_rows, token_ids, pos_start, rows,
+            cache_base_pos=cache_base_pos)
+
+    # ---------- DFlash integration ----------
+    #
+    # DFlash verifies at S=block_size (16), above
+    # ``_THOR_K_ROW_FAST_PATH_MAX``, so the K-row layers route to
+    # ``_thor_full_K_forward`` / ``_thor_lin_K_forward`` — and the
+    # full-attn K-row is single-XQA-path over the persistent FP8 KV
+    # cache. Three consequences, each handled by one override below:
+    # the drafter load must guarantee the FP8 cache exists, the prompt
+    # prefill must populate it, and the verify forward must run with
+    # the FP8-KV mode flag active.
+
+    def _load_dflash_drafter(self, ckpt_dir: str | None = None) -> None:
+        import torch
+
+        super()._load_dflash_drafter(ckpt_dir)
+        # Short-ctx constructions (user_max_seq <= LONG_CTX_THRESHOLD)
+        # never allocate the persistent FP8 KV cache; the Thor DFlash
+        # verify cannot run without it.
+        if not hasattr(self, '_fp8_K_cache'):
+            self._load_fp8_kv_cache(max_seq=self._user_max_seq + 16)
+            self._long_kv_cache_mode = 'fp8'
+        # Grow the per-step state checkpoints to the DFlash verify
+        # q_seq (block_size = _MAX_PUBLIC_SPEC_K + 1). The lin K-row
+        # save-steps branch then covers the whole verify, and the
+        # partial-accept rollback becomes two constant-time copies
+        # instead of a second main-model forward.
+        needed = self._MAX_PUBLIC_SPEC_K + 1
+        if self._K_save_max < needed:
+            self._K_save_max = needed
+            self._K_lin_state_per_step = torch.empty(
+                needed, *self._lin_state.shape,
+                device=self._lin_state.device,
+                dtype=self._lin_state.dtype)
+            self._K_lin_conv_state_per_step = torch.empty(
+                needed, *self._lin_conv_state.shape,
+                device=self._lin_conv_state.device,
+                dtype=self._lin_conv_state.dtype)
+            # Any K-row graph captured before the grow baked the old
+            # checkpoint buffers — drop those graphs so they re-capture
+            # against the new allocations.
+            for cache_name in (
+                    '_captured_verify_graphs_fp8kv',
+                    '_captured_prefill_graphs_fp8kv',
+                    '_captured_verify_graphs_tq',
+                    '_captured_prefill_graphs_tq',
+                    '_captured_verify_graphs_dflash',
+            ):
+                cache = getattr(self, cache_name, None)
+                if cache:
+                    cache.clear()
+        # Per-token drafter window (default on for Thor): the drafter
+        # attends to fc-projected features of every committed token.
+        # Measured on Thor at ctx=128: steady AL 2.53 -> 3.49 vs the
+        # one-entry-per-cycle shift window.
+        if not hasattr(self, '_dflash_pertoken_window'):
+            self._dflash_pertoken_window = os.environ.get(
+                'WLLM_QWEN36_DFLASH_PERTOKEN', '1',
+            ).strip().lower() not in ('0', 'false', 'off')
+            self._dflash_pertoken_win = int(os.environ.get(
+                'WLLM_QWEN36_DFLASH_WINDOW', '128') or '128')
+
+    def _dflash_prefill_nvfp4(self, input_ids):
+        """Thor override: chunked FP8-KV prompt prefill.
+
+        The default per-position walk writes only the BF16 KV cache;
+        the Thor verify attends over the FP8 cache, so the prompt rows
+        must land there. The chunked prefill is also the production
+        Thor TTFT path (batched XQA instead of one forward per token).
+
+        In per-token-window mode the last min(window, prompt) tokens
+        run as a separate tap-captured chunk so the drafter window
+        starts seeded with the prompt tail's features instead of
+        ramping from empty.
+        """
+        seed_window = (
+            getattr(self, '_dflash_pertoken_window', False)
+            and os.environ.get(
+                'WLLM_QWEN36_DFLASH_WINDOW_SEED', '1',
+            ).strip().lower() not in ('0', 'false', 'off'))
+        if not seed_window:
+            _, logits = self._prefill_long_ctx_tq_chunked(input_ids)
+            return logits.argmax(dim=-1, keepdim=True).view(1, 1)
+
+        from wllm.native.frontends.torch._qwen36_rtx_dflash_forward import (
+            alloc_pertoken_window,
+            pertoken_window_append,
+        )
+
+        alloc_pertoken_window(
+            self, int(getattr(self, '_dflash_pertoken_win', 128)))
+        buf = self._dflash_buf
+        P = int(input_ids.shape[1])
+        tail = min(int(buf['pt_win']), P)
+        if P > tail:
+            self._prefill_long_ctx_tq_chunked(input_ids[:, :P - tail])
+        d = self._rope_dim
+        cos_T = self._rope_cos_table[P - tail:P].view(1, tail, d)
+        sin_T = self._rope_sin_table[P - tail:P].view(1, tail, d)
+        seed = buf['pt_seed_taps']
+        logits = self.forward_own_decode_K_nvfp4_fp8kv(
+            input_ids[:, P - tail:], cos_T, sin_T, P - tail, tail,
+            tap_buf=seed, logits_mode='last')
+        rows = buf['pt_taps_rows'][:tail]
+        rows.copy_(seed[:, :tail].permute(1, 0, 2))
+        pertoken_window_append(self, rows)
+        return logits.argmax(dim=-1, keepdim=True).view(1, 1)
+
+    def _dflash_verify_forward_K(self, token_ids_K, cos_K, sin_K,
+                                 cur_pos: int, K: int, tap_buf):
+        """Thor override: run the DFlash verify in FP8-KV mode.
+
+        Same wrapper as the production long-ctx spec verify, so the
+        K-row layer dispatch sees ``_fp8_kv_verify_active`` for the
+        whole S=K forward.
+        """
+        return self.forward_own_decode_K_nvfp4_fp8kv(
+            token_ids_K, cos_K, sin_K, cur_pos, K, tap_buf=tap_buf)
+
+    def _dflash_snap_state(self, cur_pos: int, Kv: int) -> None:
+        """Thor override: nothing to snapshot.
+
+        The rollback reads the per-step checkpoints written during the
+        verify K-row itself. The Thor verify never writes the BF16 KV
+        cache, and FP8 rows past the accept point are overwritten by
+        the next verify before any read.
+        """
+        return
+
+    def _dflash_partial_rollback(self, cur_pos: int, N: int, Kv: int,
+                                 tok, drafts, cos_KN, sin_KN) -> None:
+        """Thor override: constant-time state rollback.
+
+        The verify at S=Kv ran the lin K-row save-steps branch
+        (``Kv <= _K_save_max`` after drafter load), so the state after
+        every verify row is checkpointed; committing N drafts is a copy
+        from slot N. Same pattern as the long-ctx MTP spec loop. Taps
+        for rows <= N are already in ``_dflash_taps_buf`` from the main
+        verify.
+        """
+        import torch
+
+        from wllm.native import wllm_native_kernels as fvk
+
+        s = torch.cuda.current_stream().cuda_stream
+        fvk.gpu_copy(
+            self._lin_state.data_ptr(),
+            self._K_lin_state_per_step[N].data_ptr(),
+            self._lin_state.numel() * 2, s,
+        )
+        fvk.gpu_copy(
+            self._lin_conv_state.data_ptr(),
+            self._K_lin_conv_state_per_step[N].data_ptr(),
+            self._lin_conv_state.numel() * 2, s,
+        )

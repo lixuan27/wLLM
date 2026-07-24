@@ -1,0 +1,53 @@
+model_name: LongLiveTransformer3DModel
+text_encoder_name: UMT5EncoderModel
+vae_name: AutoencoderKLWan
+device: cuda
+dtype: bfloat16
+kv_dtype: bfloat16
+seed: 42
+
+prompt: A serene landscape with rolling hills and a clear blue sky.
+
+tokenizer_path: checkpoints/wan/tokenizer
+text_encoder_path: checkpoints/wan/text_encoder
+vae_path: checkpoints/wan/vae-2.2
+transformer_path: checkpoints/longlive-2.0-5b
+
+lora_path: null
+
+max_sequence_length: 512
+
+max_num_frames: 1537
+height: 704
+width: 1280
+
+num_videos_per_prompt: 1
+num_inference_steps: 4
+first_chunk_size: 8
+chunk_size: 8
+
+context_window_size: 24
+sink_size: 8
+multi_shot_rope_offset: 8
+scene_cut_prefix: "The scene transitions. "
+
+kv_cond_tokens: 0
+guidance_scale: 1.0
+timestep_shift: 5.0
+stabilization_level: 15
+
+attention_backend: auto
+kv_memory: preallocated
+
+use_cuda_graph: false
+
+video_buffer_name: longlive_video
+ctrl_buffer_name: longlive_ctrl
+audio_buffer_name: longlive_audio_input
+signal_buffer_name: longlive_signal
+
+audio_frame_samples: 320
+audio_sample_rate: 16000
+audio_max_chunks: 8192
+
+asr_model_name: "Qwen/Qwen3-ASR-1.7B"

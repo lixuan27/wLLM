@@ -1,0 +1,26 @@
+# Runtime config for the <app> application.
+#
+# Everything reads this one file: the reference backend, every optimized
+# backend variant, and the frontend (through the adapter). Keep the buffer
+# names fixed so any backend can serve the same frontend.
+
+# -------- model selection / checkpoint paths --------
+# model_name: ...
+# transformer_path: /path/to/checkpoint/...
+
+# -------- generation settings --------
+seed: 42
+# prompt: ...
+# height: 704
+# width: 1280
+# chunk_size: 4
+
+# -------- runtime controls --------
+device: cuda
+dtype: bfloat16
+# attention_backend: auto
+
+# -------- IPC buffers (shared by all backends and the frontend) --------
+# video_buffer_name: <app>_video
+# ctrl_buffer_name: <app>_ctrl
+# action_buffer_name: <app>_action

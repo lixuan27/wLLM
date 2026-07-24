@@ -1,0 +1,924 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Start/Restart Gate + WASD</title>
+    <style>
+      :root{
+        --bg0:#070A12;
+        --bg1:#0B1224;
+        --text:#EAF2FF;
+        --muted: rgba(234,242,255,0.68);
+        --neon:#59FFF1;
+        --neon2:#A78BFA;
+        --warn:#FFB86B;
+        --danger:#FF4D6D;
+        --shadow: 0 20px 60px rgba(0,0,0,0.55);
+        --radius: 18px;
+      }
+
+      *{ box-sizing:border-box; }
+      html,body{ height:100%; }
+      body{
+        margin:0;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+        color:var(--text);
+        background:
+          radial-gradient(1200px 700px at 15% 10%, rgba(89,255,241,0.12), transparent 55%),
+          radial-gradient(900px 600px at 85% 25%, rgba(167,139,250,0.14), transparent 55%),
+          radial-gradient(900px 600px at 45% 110%, rgba(89,255,241,0.10), transparent 60%),
+          linear-gradient(180deg, var(--bg0), var(--bg1));
+        overflow-x:hidden;
+      }
+
+      body:before{
+        content:"";
+        position:fixed; inset:0;
+        background-image:
+          linear-gradient(to right, rgba(255,255,255,0.045) 1px, transparent 1px),
+          linear-gradient(to bottom, rgba(255,255,255,0.045) 1px, transparent 1px);
+        background-size: 42px 42px;
+        opacity:0.22;
+        pointer-events:none;
+        mask-image: radial-gradient(circle at 40% 20%, rgba(0,0,0,1), rgba(0,0,0,0.15) 55%, rgba(0,0,0,0) 75%);
+      }
+
+      .wrap{ max-width: 1180px; margin: 0 auto; padding: 26px 18px 40px; }
+
+      .topbar{
+        display:flex; gap:16px; align-items:flex-start; justify-content:space-between; flex-wrap:wrap;
+        margin-bottom: 16px;
+      }
+
+      .title{ display:flex; flex-direction:column; gap:6px; }
+      .title h1{ margin:0; font-size: 18px; letter-spacing: 0.4px; font-weight: 700; }
+      .title .sub{ color: var(--muted); font-size: 13px; line-height: 1.4; }
+
+      .pill{
+        display:inline-flex; align-items:center; gap:8px;
+        padding: 10px 12px; border-radius: 999px;
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.10);
+        backdrop-filter: blur(10px);
+        box-shadow: 0 10px 30px rgba(0,0,0,0.28);
+      }
+      .dot{ width:10px; height:10px; border-radius:50%; background: rgba(255,255,255,0.35); box-shadow: 0 0 0 4px rgba(255,255,255,0.08); }
+      .dot.ok{ background: var(--neon); box-shadow: 0 0 0 4px rgba(89,255,241,0.14), 0 0 22px rgba(89,255,241,0.35); }
+      .dot.warn{ background: var(--warn); box-shadow: 0 0 0 4px rgba(255,184,107,0.14), 0 0 22px rgba(255,184,107,0.30); }
+      .dot.bad{ background: var(--danger); box-shadow: 0 0 0 4px rgba(255,77,109,0.14), 0 0 22px rgba(255,77,109,0.30); }
+      .stateText{ font-size: 13px; color: var(--muted); white-space:nowrap; }
+
+      .grid{ display:grid; grid-template-columns: 1.4fr 1fr; gap: 16px; }
+      @media (max-width: 980px){ .grid{ grid-template-columns: 1fr; } }
+
+      .card{
+        background: linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.045));
+        border: 1px solid rgba(255,255,255,0.10);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(12px);
+        overflow:hidden;
+        position:relative;
+      }
+      .card:before{
+        content:""; position:absolute; inset:-1px;
+        background: linear-gradient(90deg, rgba(89,255,241,0.22), rgba(167,139,250,0.18), rgba(89,255,241,0.16));
+        opacity:0.35; filter: blur(18px); pointer-events:none;
+      }
+      .card > *{ position:relative; }
+
+      .cardHeader{
+        padding: 14px 14px 10px;
+        display:flex; align-items:center; justify-content:space-between;
+        border-bottom: 1px solid rgba(255,255,255,0.08);
+      }
+      .cardHeader h2{
+        margin:0;
+        font-size: 13px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: rgba(234,242,255,0.80);
+      }
+      .cardBody{ padding: 14px; }
+
+      .videoWrap{ padding: 14px; }
+      video{
+        width: 100%;
+        aspect-ratio: 16 / 9;
+        background:#000;
+        border-radius: 14px;
+        display:block;
+        border: 1px solid rgba(255,255,255,0.10);
+        box-shadow: 0 0 0 1px rgba(89,255,241,0.08), 0 30px 90px rgba(0,0,0,0.55);
+      }
+
+      .btn{
+        appearance:none;
+        border: 1px solid rgba(255,255,255,0.14);
+        background: rgba(255,255,255,0.06);
+        color: var(--text);
+        padding: 10px 12px;
+        border-radius: 12px;
+        font-weight: 650;
+        letter-spacing: 0.2px;
+        cursor:pointer;
+        transition: transform .08s ease, background .2s ease, border-color .2s ease, box-shadow .2s ease, opacity .2s ease;
+        user-select:none;
+      }
+      .btn:hover{
+        background: rgba(255,255,255,0.09);
+        border-color: rgba(89,255,241,0.22);
+        box-shadow: 0 0 0 1px rgba(89,255,241,0.12), 0 0 24px rgba(89,255,241,0.10);
+      }
+      .btn:active{ transform: translateY(1px); }
+      .btn:disabled{ opacity:0.45; cursor:not-allowed; box-shadow:none; }
+      .btnPrimary{
+        border-color: rgba(89,255,241,0.28);
+        box-shadow: 0 0 0 1px rgba(89,255,241,0.10), 0 0 30px rgba(89,255,241,0.10);
+      }
+      .btnDanger{ border-color: rgba(255,77,109,0.28); }
+      .btnDanger:hover{
+        border-color: rgba(255,77,109,0.40);
+        box-shadow: 0 0 0 1px rgba(255,77,109,0.14), 0 0 26px rgba(255,77,109,0.10);
+      }
+
+      .metrics{ display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+      .metric{
+        padding: 12px 12px;
+        border-radius: 14px;
+        background: rgba(0,0,0,0.22);
+        border: 1px solid rgba(255,255,255,0.10);
+      }
+      .metric .k{
+        font-size: 11px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: rgba(234,242,255,0.62);
+        margin-bottom: 6px;
+      }
+      .metric .v{ font-size: 16px; font-weight: 750; color: rgba(234,242,255,0.92); }
+      .metric .v span{ font-size: 12px; font-weight: 650; color: rgba(234,242,255,0.70); }
+
+      .controlsRow{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; }
+      .wasdGrid{
+        display:grid;
+        grid-template-columns: 56px 56px 56px;
+        grid-template-rows: 48px 48px;
+        gap: 10px;
+        justify-content:flex-start;
+        align-items:center;
+      }
+      .wasdGrid .spacer{ width:56px; height:48px; }
+      .keybtn{
+        width:56px; height:48px;
+        border-radius: 14px;
+        font-size: 16px;
+        letter-spacing: 0.04em;
+        position:relative;
+        overflow:hidden;
+      }
+      .keybtn:before{
+        content:"";
+        position:absolute; inset:-1px;
+        background: radial-gradient(400px 140px at 30% 0%, rgba(89,255,241,0.22), transparent 60%),
+                    radial-gradient(400px 140px at 70% 100%, rgba(167,139,250,0.20), transparent 65%);
+        opacity:0.6;
+        pointer-events:none;
+      }
+
+      @keyframes neonPulse {
+        0%   { box-shadow: 0 0 0 1px rgba(89,255,241,0.18), 0 0 18px rgba(89,255,241,0.18), 0 0 34px rgba(167,139,250,0.10); }
+        50%  { box-shadow: 0 0 0 1px rgba(89,255,241,0.28), 0 0 26px rgba(89,255,241,0.30), 0 0 52px rgba(167,139,250,0.18); }
+        100% { box-shadow: 0 0 0 1px rgba(89,255,241,0.18), 0 0 18px rgba(89,255,241,0.18), 0 0 34px rgba(167,139,250,0.10); }
+      }
+      .keybtn.active{
+        border-color: rgba(89,255,241,0.40) !important;
+        background: rgba(89,255,241,0.10) !important;
+        transform: translateY(1px);
+        animation: neonPulse 0.9s ease-in-out infinite;
+      }
+      .keybtn.active:after{
+        content:"";
+        position:absolute; inset:-1px;
+        border-radius: 14px;
+        background: radial-gradient(220px 120px at 50% 20%, rgba(89,255,241,0.35), transparent 60%),
+                    radial-gradient(240px 140px at 50% 110%, rgba(167,139,250,0.28), transparent 60%);
+        opacity: 0.9;
+        pointer-events:none;
+        mix-blend-mode: screen;
+      }
+
+      .hint{ margin-top: 10px; color: rgba(234,242,255,0.62); font-size: 12.5px; line-height: 1.4; }
+      .kbd{
+        display:inline-block;
+        padding: 2px 7px;
+        border-radius: 8px;
+        border: 1px solid rgba(255,255,255,0.14);
+        background: rgba(0,0,0,0.25);
+        font-size: 12px;
+        color: rgba(234,242,255,0.85);
+        margin: 0 2px;
+      }
+
+      .sliders{ display:grid; grid-template-columns: 1fr; gap: 12px; }
+      .slider{
+        padding: 12px;
+        border-radius: 14px;
+        background: rgba(0,0,0,0.22);
+        border: 1px solid rgba(255,255,255,0.10);
+      }
+      .slider .labelRow{
+        display:flex; justify-content:space-between; align-items:center; margin-bottom: 8px;
+      }
+      .slider .name{
+        font-size: 12px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: rgba(234,242,255,0.70);
+      }
+      .slider .val{
+        font-size: 12px;
+        color: rgba(234,242,255,0.78);
+        font-weight: 700;
+      }
+      select{
+        width:100%;
+        padding: 10px 10px;
+        border-radius: 12px;
+        border: 1px solid rgba(255,255,255,0.14);
+        background: rgba(0,0,0,0.28);
+        color: rgba(234,242,255,0.92);
+        outline: none;
+      }
+      select:disabled{ opacity:0.5; cursor:not-allowed; }
+
+      .logHeader{ display:flex; align-items:center; justify-content:space-between; gap:10px; }
+      .logBtn{ padding: 8px 10px; border-radius: 12px; font-weight: 700; font-size: 12px; }
+      .logWrap{
+        margin-top: 12px;
+        border-radius: 14px;
+        background: rgba(0,0,0,0.28);
+        border: 1px solid rgba(255,255,255,0.10);
+        overflow:hidden;
+        transition: max-height .25s ease, opacity .25s ease;
+        max-height: 0; opacity: 0;
+      }
+      .logWrap.open{ max-height: 360px; opacity: 1; }
+      pre{
+        margin:0; padding: 12px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 12px; line-height: 1.4;
+        color: rgba(89,255,241,0.92);
+        height: 340px; overflow:auto;
+        white-space: pre-wrap; word-break: break-word;
+      }
+
+      .footerNote{ margin-top: 14px; color: rgba(234,242,255,0.50); font-size: 12px; }
+    </style>
+  </head>
+
+  <body>
+    <div class="wrap">
+      <div class="topbar">
+        <div class="title">
+          <h1>WebRTC Control Loop <span style="color:rgba(89,255,241,0.9)">·</span> Start/Restart Gate + WASD + Arrow Keys</h1>
+          <div class="sub">
+            Frames are produced <b>only after Start</b>. Restart resets state and returns to <b>WAITING</b>.
+            Use <span class="kbd">W</span><span class="kbd">A</span><span class="kbd">S</span><span class="kbd">D</span> for movement and <span class="kbd">↑</span><span class="kbd">↓</span><span class="kbd">←</span><span class="kbd">→</span> for camera rotation.
+          </div>
+        </div>
+
+        <div class="pill" title="Connection state">
+          <div id="stateDot" class="dot"></div>
+          <div id="state" class="stateText">State: connecting...</div>
+        </div>
+      </div>
+
+      <div class="grid">
+        <!-- Left: Video -->
+        <div class="card">
+          <div class="cardHeader">
+            <h2>Video Stream</h2>
+            <div style="display:flex; gap:10px; align-items:center;">
+              <button id="btnUpload" class="btn" disabled>Upload Image</button>
+              <button id="btnStart" class="btn btnPrimary" disabled>Start</button>
+              <button id="btnRestart" class="btn btnDanger" disabled>Restart</button>
+            </div>
+          </div>
+          <div class="videoWrap">
+            <video id="v" autoplay playsinline muted></video>
+            <input type="file" id="imageInput" accept="image/*" style="display:none">
+            <div class="footerNote">Tip: if you are on cloud/public network and connection fails, you may need TURN.</div>
+          </div>
+        </div>
+
+        <!-- Right: Controls + Metrics -->
+        <div class="card">
+          <div class="cardHeader">
+            <h2>Controls & Telemetry</h2>
+            <button id="btnStats" class="btn logBtn" disabled>Get Stats</button>
+          </div>
+
+          <div class="cardBody">
+            <div class="metrics" style="margin-bottom:12px;">
+              <div class="metric">
+                <div class="k">ACK RTT</div>
+                <div class="v" id="rttAck">-- <span>ms</span></div>
+              </div>
+              <div class="metric">
+                <div class="k">Network RTT</div>
+                <div class="v" id="netRtt">-- <span>ms</span></div>
+              </div>
+              <div class="metric">
+                <div class="k">FPS</div>
+                <div class="v" id="fpsNow">-- <span>fps</span></div>
+              </div>
+              <div class="metric">
+                <div class="k">Last Event</div>
+                <div class="v" id="last" style="font-size:13px; font-weight:700; line-height:1.2;">--</div>
+              </div>
+            </div>
+
+            <div class="controlsRow" style="margin-bottom:12px;">
+              <div>
+                <div style="display:flex; gap:24px; align-items:start;">
+                  <div>
+                    <div style="font-size:11px; letter-spacing:0.12em; text-transform:uppercase; color:rgba(234,242,255,0.62); margin-bottom:6px;">Movement</div>
+                    <div class="wasdGrid" aria-label="WASD pad">
+                      <div class="spacer"></div>
+                      <button id="btnW" class="btn keybtn" disabled>W</button>
+                      <div class="spacer"></div>
+                      <button id="btnA" class="btn keybtn" disabled>A</button>
+                      <button id="btnS" class="btn keybtn" disabled>S</button>
+                      <button id="btnD" class="btn keybtn" disabled>D</button>
+                    </div>
+                  </div>
+                  <div>
+                    <div style="font-size:11px; letter-spacing:0.12em; text-transform:uppercase; color:rgba(234,242,255,0.62); margin-bottom:6px;">Camera</div>
+                    <div class="wasdGrid" aria-label="Arrow key pad">
+                      <div class="spacer"></div>
+                      <button id="btnUp" class="btn keybtn" disabled>↑</button>
+                      <div class="spacer"></div>
+                      <button id="btnLeft" class="btn keybtn" disabled>←</button>
+                      <button id="btnDown" class="btn keybtn" disabled>↓</button>
+                      <button id="btnRight" class="btn keybtn" disabled>→</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="hint">Movement: <span class="kbd">W</span><span class="kbd">A</span><span class="kbd">S</span><span class="kbd">D</span> &nbsp; Camera: <span class="kbd">↑</span><span class="kbd">↓</span><span class="kbd">←</span><span class="kbd">→</span> (only after Start).</div>
+              </div>
+
+              <div style="min-width:260px; width:100%;">
+                <div class="sliders">
+                  <div class="slider">
+                    <div class="labelRow">
+                      <div class="name">FPS (WAITING only)</div>
+                      <div class="val" id="fpsVal">30</div>
+                    </div>
+                    <select id="fpsSelect" disabled>
+                      <option value="10">10</option>
+                      <option value="15">15</option>
+                      <option value="24">24</option>
+                      <option value="30" selected>30</option>
+                      <option value="45">45</option>
+                      <option value="60">60</option>
+                      <option value="90">90</option>
+                      <option value="120">120</option>
+                    </select>
+                    <div class="hint" style="margin-top:8px;">
+                      You can change FPS while <b>not started</b>. After Start, FPS is locked.
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="logHeader">
+              <div class="hint" style="margin:0;">Log is collapsed by default to keep the UI clean.</div>
+              <div style="display:flex; gap:10px;">
+                <button id="btnToggleLog" class="btn logBtn">Show Log</button>
+                <button id="btnClearLog" class="btn logBtn">Clear</button>
+              </div>
+            </div>
+
+            <div id="logWrap" class="logWrap">
+              <pre id="log"></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const video = document.getElementById("v");
+      const logEl = document.getElementById("log");
+      const logWrap = document.getElementById("logWrap");
+      const btnToggleLog = document.getElementById("btnToggleLog");
+      const btnClearLog = document.getElementById("btnClearLog");
+
+      const btnStart = document.getElementById("btnStart");
+      const btnRestart = document.getElementById("btnRestart");
+      const btnStats = document.getElementById("btnStats");
+      const btnUpload = document.getElementById("btnUpload");
+      const imageInput = document.getElementById("imageInput");
+
+      const stateEl = document.getElementById("state");
+      const stateDot = document.getElementById("stateDot");
+
+      const btnW = document.getElementById("btnW");
+      const btnA = document.getElementById("btnA");
+      const btnS = document.getElementById("btnS");
+      const btnD = document.getElementById("btnD");
+      const btnUp = document.getElementById("btnUp");
+      const btnDown = document.getElementById("btnDown");
+      const btnLeft = document.getElementById("btnLeft");
+      const btnRight = document.getElementById("btnRight");
+
+      const rttAckEl = document.getElementById("rttAck");
+      const netRttEl = document.getElementById("netRtt");
+      const fpsNowEl = document.getElementById("fpsNow");
+      const lastEl = document.getElementById("last");
+
+      const fpsSelect = document.getElementById("fpsSelect");
+      const fpsVal = document.getElementById("fpsVal");
+
+      function setDot(mode){
+        stateDot.classList.remove("ok","warn","bad");
+        if (mode) stateDot.classList.add(mode);
+      }
+
+      function log(...args) {
+        const s = args.map(x => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
+        logEl.textContent += s + "\n";
+        logEl.scrollTop = logEl.scrollHeight;
+        console.log(...args);
+      }
+
+      // Log toggle (collapsed by default)
+      let logOpen = false;
+      function setLogOpen(open){
+        logOpen = open;
+        if (open) {
+          logWrap.classList.add("open");
+          btnToggleLog.textContent = "Hide Log";
+        } else {
+          logWrap.classList.remove("open");
+          btnToggleLog.textContent = "Show Log";
+        }
+      }
+      setLogOpen(false);
+      btnToggleLog.onclick = () => setLogOpen(!logOpen);
+      btnClearLog.onclick = () => { logEl.textContent = ""; };
+
+      let started = false;
+      let sessionId = null;
+
+      function setUIConnected(ok) {
+        btnStart.disabled = !ok;
+        btnRestart.disabled = !ok;
+        btnStats.disabled = !ok;
+        // FPS can be changed only when connected AND not started
+        fpsSelect.disabled = !(ok && !started);
+        btnUpload.disabled = !(ok && !started);
+      }
+
+      function setWASDEnabled(ok) {
+        btnW.disabled = !ok;
+        btnA.disabled = !ok;
+        btnS.disabled = !ok;
+        btnD.disabled = !ok;
+        btnUp.disabled = !ok;
+        btnDown.disabled = !ok;
+        btnLeft.disabled = !ok;
+        btnRight.disabled = !ok;
+      }
+
+      async function waitIceComplete(pc, timeoutMs = 8000) {
+        if (pc.iceGatheringState === "complete") return;
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            pc.removeEventListener("icegatheringstatechange", onChange);
+            reject(new Error("ICE gathering timeout"));
+          }, timeoutMs);
+          function onChange() {
+            if (pc.iceGatheringState === "complete") {
+              clearTimeout(timer);
+              pc.removeEventListener("icegatheringstatechange", onChange);
+              resolve();
+            }
+          }
+          pc.addEventListener("icegatheringstatechange", onChange);
+        });
+      }
+
+      function newId() {
+        return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + "-" + Math.random());
+      }
+
+      const KEY_TO_CODE = { w: 1, s: 2, d: 3, a: 4 };
+      const ROTATION_KEY_TO_CODE = { arrowup: 1, arrowdown: 2, arrowright: 3, arrowleft: 4 };
+
+      const heldKeys = new Set();
+
+      let pc = null;
+      let dc = null;
+
+      // id -> {t_click}
+      const sent = new Map();
+
+      // --- Key highlight helpers ---
+      const KEY_TO_BTN = { w: btnW, a: btnA, s: btnS, d: btnD, arrowup: btnUp, arrowdown: btnDown, arrowleft: btnLeft, arrowright: btnRight };
+
+      function setKeyActive(keyLower, on) {
+        const b = KEY_TO_BTN[keyLower];
+        if (!b) return;
+        if (on) b.classList.add("active");
+        else b.classList.remove("active");
+      }
+
+      function bindButtonGlow(btn, keyLower) {
+        btn.addEventListener("pointerdown", () => setKeyActive(keyLower, true));
+        btn.addEventListener("pointerup", () => setKeyActive(keyLower, false));
+        btn.addEventListener("pointerleave", () => setKeyActive(keyLower, false));
+        btn.addEventListener("pointercancel", () => setKeyActive(keyLower, false));
+      }
+
+      bindButtonGlow(btnW, "w");
+      bindButtonGlow(btnA, "a");
+      bindButtonGlow(btnS, "s");
+      bindButtonGlow(btnD, "d");
+      bindButtonGlow(btnUp, "arrowup");
+      bindButtonGlow(btnDown, "arrowdown");
+      bindButtonGlow(btnLeft, "arrowleft");
+      bindButtonGlow(btnRight, "arrowright");
+
+      function resetToWaitingUI(label = "State: connected (press Start)") {
+        started = false;
+        setWASDEnabled(false);
+
+        // enable Start
+        btnStart.disabled = false;
+
+        // enable FPS change in waiting
+        fpsSelect.disabled = false;
+        btnUpload.disabled = !(dc && dc.readyState === "open");
+
+        // clear metrics
+        sent.clear();
+        heldKeys.clear();
+        lastEl.textContent = "--";
+        rttAckEl.textContent = "-- ms";
+
+        stateEl.textContent = label;
+
+        ["w","a","s","d","arrowup","arrowdown","arrowleft","arrowright"].forEach(k => setKeyActive(k, false));
+      }
+
+      function sendStart() {
+        if (!dc || dc.readyState !== "open") return;
+        dc.send(JSON.stringify({ cmd: "start", t_send_ms: Date.now() }));
+        stateEl.textContent = "State: starting...";
+        btnStart.disabled = true;
+        fpsSelect.disabled = true;
+        btnUpload.disabled = true;
+      }
+
+      function sendRestart() {
+        if (!dc || dc.readyState !== "open") return;
+        dc.send(JSON.stringify({ cmd: "restart", t_send_ms: Date.now() }));
+        stateEl.textContent = "State: restarting...";
+        btnStart.disabled = true;
+        setWASDEnabled(false);
+        ["w","a","s","d","arrowup","arrowdown","arrowleft","arrowright"].forEach(k => setKeyActive(k, false));
+      }
+
+      function sendSetFps(fps) {
+        if (!dc || dc.readyState !== "open") return;
+        dc.send(JSON.stringify({ cmd: "set_fps", fps: Number(fps) }));
+        lastEl.textContent = `set_fps -> ${fps} (waiting only)`;
+      }
+
+      fpsSelect.addEventListener("change", () => {
+        const v = Number(fpsSelect.value);
+        fpsVal.textContent = String(v);
+        // only send if we are waiting
+        if (!started) sendSetFps(v);
+      });
+
+      function getTransCode() {
+        const w = heldKeys.has("w"), s = heldKeys.has("s");
+        const d = heldKeys.has("d"), a = heldKeys.has("a");
+        const fwd = w && !s, bwd = s && !w;
+        const rht = d && !a, lft = a && !d;
+        if (fwd && rht) return 5;   // W+D
+        if (fwd && lft) return 6;   // W+A
+        if (bwd && rht) return 7;   // S+D
+        if (bwd && lft) return 8;   // S+A
+        if (fwd) return 1;          // W
+        if (bwd) return 2;          // S
+        if (rht) return 3;          // D
+        if (lft) return 4;          // A
+        return 0;
+      }
+
+      function getRotCode() {
+        const up = heldKeys.has("arrowup"), dn = heldKeys.has("arrowdown");
+        const rt = heldKeys.has("arrowright"), lt = heldKeys.has("arrowleft");
+        const pitch_up = up && !dn, pitch_dn = dn && !up;
+        const yaw_rt = rt && !lt, yaw_lt = lt && !rt;
+        if (pitch_up && yaw_rt) return 5;   // up+right
+        if (pitch_up && yaw_lt) return 6;   // up+left
+        if (pitch_dn && yaw_rt) return 7;   // down+right
+        if (pitch_dn && yaw_lt) return 8;   // down+left
+        if (pitch_up) return 1;              // up
+        if (pitch_dn) return 2;              // down
+        if (yaw_rt)   return 3;              // right
+        if (yaw_lt)   return 4;              // left
+        return 0;
+      }
+
+      const TRANS_NAMES = ["·","W","S","D","A","W+D","W+A","S+D","S+A"];
+      const ROT_NAMES   = ["·","↑","↓","→","←","↑→","↑←","↓→","↓←"];
+
+      function sendCombinedAction() {
+        if (!started) return;
+        if (!dc || dc.readyState !== "open") return;
+
+        const t9 = getTransCode();
+        const r9 = getRotCode();
+        const combined = t9 + r9 * 9;
+        const displayKey = (t9 ? TRANS_NAMES[t9] : "") + (t9 && r9 ? "+" : "") + (r9 ? ROT_NAMES[r9] : "") || "noop";
+
+        const id = newId();
+        const t_click = performance.now();
+        sent.set(id, { t_click });
+
+        dc.send(JSON.stringify({
+          cmd: "action",
+          key: displayKey,
+          code: combined,
+          id: id,
+          t_send_ms: Date.now()
+        }));
+
+        lastEl.textContent = `sent ${displayKey} · code=${combined} · id=${id.slice(0,8)}`;
+        log("SENT action:", { id, key: displayKey, code: combined });
+      }
+
+      function clickKey(keyLower){
+        setKeyActive(keyLower, true);
+        heldKeys.add(keyLower);
+        sendCombinedAction();
+        setTimeout(() => { setKeyActive(keyLower, false); heldKeys.delete(keyLower); }, 140);
+      }
+
+      // Click handlers
+      btnStart.onclick = sendStart;
+      btnRestart.onclick = sendRestart;
+
+      btnUpload.onclick = () => imageInput.click();
+
+      imageInput.onchange = async () => {
+        const file = imageInput.files[0];
+        if (!file) return;
+
+        btnUpload.disabled = true;
+        btnUpload.textContent = "Uploading...";
+        btnStart.disabled = true;
+
+        try {
+          const formData = new FormData();
+          formData.append("image", file);
+          formData.append("session_id", sessionId);
+
+          const resp = await fetch("/upload_image", {
+            method: "POST",
+            body: formData
+          });
+
+          const result = await resp.json();
+          if (result.ok) {
+            log("Image uploaded:", file.name);
+            lastEl.textContent = "image uploaded: " + file.name;
+          } else {
+            log("Upload failed:", result.error);
+            lastEl.textContent = "upload failed: " + (result.error || "unknown");
+          }
+        } catch (err) {
+          log("Upload error:", String(err));
+          lastEl.textContent = "upload error";
+        } finally {
+          btnUpload.textContent = "Upload Image";
+          if (!started && dc && dc.readyState === "open") {
+            btnUpload.disabled = false;
+            btnStart.disabled = false;
+          }
+          imageInput.value = "";
+        }
+      };
+
+      btnW.onclick = () => clickKey("w");
+      btnA.onclick = () => clickKey("a");
+      btnS.onclick = () => clickKey("s");
+      btnD.onclick = () => clickKey("d");
+      btnUp.onclick = () => clickKey("arrowup");
+      btnDown.onclick = () => clickKey("arrowdown");
+      btnLeft.onclick = () => clickKey("arrowleft");
+      btnRight.onclick = () => clickKey("arrowright");
+
+      // Keyboard press highlight + action trigger
+      window.addEventListener("keydown", (e) => {
+        const k = (e.key || "").toLowerCase();
+        const isAction = !!KEY_TO_CODE[k];
+        const isRotation = !!ROTATION_KEY_TO_CODE[k];
+        if (!isAction && !isRotation) return;
+
+        setKeyActive(k, true);
+        if (!started) return;
+
+        e.preventDefault();
+        if (e.repeat) return;
+
+        heldKeys.add(k);
+        sendCombinedAction();
+      });
+
+      window.addEventListener("keyup", (e) => {
+        const k = (e.key || "").toLowerCase();
+        if (!KEY_TO_CODE[k] && !ROTATION_KEY_TO_CODE[k]) return;
+        setKeyActive(k, false);
+        heldKeys.delete(k);
+      });
+
+      window.addEventListener("blur", () => {
+        ["w","a","s","d","arrowup","arrowdown","arrowleft","arrowright"].forEach(k => setKeyActive(k, false));
+        heldKeys.clear();
+      });
+
+      // Ping loop (rough network RTT)
+      let pingTimer = null;
+      function startPing() {
+        if (pingTimer) clearInterval(pingTimer);
+        pingTimer = setInterval(() => {
+          if (!dc || dc.readyState !== "open") return;
+          dc.send(JSON.stringify({ cmd: "ping", t_client_ms: Date.now() }));
+        }, 1500);
+      }
+
+      async function start() {
+        setUIConnected(false);
+        resetToWaitingUI("State: connecting...");
+        setDot("warn");
+
+        // initial FPS in UI
+        fpsVal.textContent = fpsSelect.value;
+        fpsNowEl.textContent = fpsSelect.value + " fps";
+
+        pc = new RTCPeerConnection({
+          iceServers: [
+            { urls: "stun:stun.l.google.com:19302" },
+            { urls: "stun:stun1.l.google.com:19302" },
+          ]
+        });
+
+        pc.ontrack = (evt) => {
+          log("ontrack:", evt.track.kind);
+          video.srcObject = evt.streams[0];
+        };
+
+        pc.oniceconnectionstatechange = () => {
+          log("iceConnectionState:", pc.iceConnectionState);
+          if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") setDot("ok");
+          if (pc.iceConnectionState === "checking") setDot("warn");
+          if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") setDot("bad");
+        };
+        pc.onconnectionstatechange = () => {
+          log("connectionState:", pc.connectionState);
+          if (pc.connectionState === "connected") setDot("ok");
+          if (pc.connectionState === "connecting" || pc.connectionState === "new") setDot("warn");
+          if (pc.connectionState === "failed" || pc.connectionState === "disconnected" || pc.connectionState === "closed") setDot("bad");
+        };
+
+        pc.addTransceiver("video", { direction: "recvonly" });
+
+        dc = pc.createDataChannel("control");
+        dc.onopen = () => {
+          log("DataChannel open");
+          started = false;
+          setUIConnected(true);
+          setWASDEnabled(false);
+          startPing();
+          stateEl.textContent = "State: connected (press Start)";
+          setDot("ok");
+
+          // send initial FPS (optional but keeps server in sync)
+          sendSetFps(Number(fpsSelect.value));
+        };
+        dc.onclose = () => {
+          log("DataChannel closed");
+          setUIConnected(false);
+          setWASDEnabled(false);
+          started = false;
+          stateEl.textContent = "State: disconnected";
+          setDot("bad");
+        };
+        dc.onerror = (e) => log("DataChannel error:", String(e));
+
+        dc.onmessage = (e) => {
+          let msg;
+          try { msg = JSON.parse(e.data); }
+          catch { log("DC raw:", e.data); return; }
+
+          if (msg.type === "started") {
+            started = true;
+            setWASDEnabled(true);
+            btnStart.disabled = true;
+            fpsSelect.disabled = true;
+            btnUpload.disabled = true;
+            stateEl.textContent = "State: started";
+            fpsNowEl.textContent = (msg.fps ?? fpsSelect.value) + " fps";
+            lastEl.textContent = "started";
+            log("STARTED:", msg);
+            return;
+          }
+
+          if (msg.type === "restarted") {
+            resetToWaitingUI("State: connected (press Start)");
+            fpsNowEl.textContent = (msg.fps ?? fpsSelect.value) + " fps";
+            lastEl.textContent = "restarted → waiting";
+            log("RESTARTED:", msg);
+            return;
+          }
+
+          if (msg.type === "fps") {
+            fpsNowEl.textContent = msg.fps + " fps";
+            if (msg.ok) {
+              fpsSelect.value = String(msg.fps);
+              fpsVal.textContent = String(msg.fps);
+              lastEl.textContent = `fps updated -> ${msg.fps}`;
+            } else {
+              lastEl.textContent = `fps change rejected (started)`;
+            }
+            log("FPS:", msg);
+            return;
+          }
+
+          if (msg.type === "error") {
+            log("ERROR:", msg);
+            stateEl.textContent = `State: error (${msg.reason || "unknown"})`;
+            setDot("bad");
+            if (msg.reason === "not_started") btnStart.disabled = false;
+            return;
+          }
+
+          if (msg.type === "ack" && msg.id && sent.has(msg.id)) {
+            const t0 = sent.get(msg.id).t_click;
+            const rtt = performance.now() - t0;
+            rttAckEl.textContent = rtt.toFixed(1) + " ms";
+            lastEl.textContent = `ack ${msg.action} · code=${msg.code} · id=${msg.id.slice(0,8)}`;
+            log("ACK:", msg, "ACK_RTT(ms)=", rtt.toFixed(1));
+            return;
+          }
+
+          if (msg.type === "pong" && typeof msg.t_client_ms === "number") {
+            const rtt = Date.now() - msg.t_client_ms;
+            netRttEl.textContent = rtt + " ms";
+            return;
+          }
+
+          if (msg.type === "stats") {
+            log("STATS:", msg);
+            lastEl.textContent = `stats: played=${msg.num_played_frames} fps=${msg.fps} started=${msg.started}`;
+            return;
+          }
+
+          log("DC msg:", msg);
+        };
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        try { await waitIceComplete(pc, 8000); }
+        catch (e) { log("WARN:", String(e)); }
+
+        const resp = await fetch("/offer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
+        });
+
+        const answer = await resp.json();
+        sessionId = answer.session_id;
+        await pc.setRemoteDescription({sdp: answer.sdp, type: answer.type});
+        log("WebRTC negotiation done");
+      }
+
+      btnStats.onclick = () => {
+        if (!dc || dc.readyState !== "open") return;
+        dc.send(JSON.stringify({ cmd: "stats" }));
+      };
+
+      start().catch(err => log("start error:", String(err)));
+    </script>
+  </body>
+</html>

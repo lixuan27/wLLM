@@ -1,0 +1,596 @@
+"""Model-runtime acceptance for the PYTHON producer — model-free, one GPU graph.
+
+Verifies build_model_runtime end to end:
+  1. struct ABI layout: a ctypes mirror of frt_model_runtime_v1 (+ port/stage
+     descriptors) reads back exactly what the specs declared;
+  2. identity: port schema and stage DAG are fingerprinted; a port shape
+     change changes the fingerprint;
+  3. verbs: Python callables are reachable THROUGH THE C FUNCTION POINTERS
+     (the same entry a native consumer uses), including error translation
+     and the bytes-capacity protocol of get_output;
+  4. lifetime: one reference spans export + ports + verbs; the anchor dies
+     on the final release.
+
+Run from the repo root (after building exec/ and runtime/):
+    PYTHONPATH=.:./exec/build:./runtime/build python runtime/tests/test_model_runtime_py.py
+"""
+
+import ctypes
+import gc
+import weakref
+
+import _wllm_exec as ex
+import _wllm_runtime as rt
+
+import wllm.native.runtime.export as export_mod
+from wllm.native.runtime.export import (
+    BufferSpec, GenericStageSpec, GraphSpec, PortSpec, RegionSpec, StageSpec,
+    StreamSpec, build_metadata_model_runtime, build_model_runtime,
+    DTYPE, LAYOUT, MODALITY, UPDATE,
+)
+from wllm.native.subgraphs.stage_plan import (
+    StagePlan,
+    list_stage_plans,
+    register_stage_plan,
+    resolve_stage_plan,
+)
+from wllm.native.subgraphs.capture import register_export_graph
+
+CHECKS = []
+
+
+def check(name, ok):
+    CHECKS.append((name, bool(ok)))
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
+
+
+# --- ctypes mirrors of the v1 ABI (must match wllm/model_runtime.h) ---
+class PortDesc(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char_p),
+                ("modality", ctypes.c_uint32), ("dtype", ctypes.c_uint32),
+                ("layout", ctypes.c_uint32), ("direction", ctypes.c_uint32),
+                ("update", ctypes.c_uint32), ("required", ctypes.c_uint32),
+                ("shape", ctypes.POINTER(ctypes.c_int64)),
+                ("rank", ctypes.c_uint32),
+                ("cadence_hint_hz", ctypes.c_uint32),
+                ("buffer", ctypes.c_void_p),
+                ("offset", ctypes.c_uint64), ("bytes", ctypes.c_uint64)]
+
+
+class StageDesc(ctypes.Structure):
+    _fields_ = [("graph", ctypes.c_uint32), ("n_after", ctypes.c_uint32),
+                ("after", ctypes.POINTER(ctypes.c_uint32))]
+
+
+class Verbs(ctypes.Structure):
+    _fields_ = [("struct_size", ctypes.c_uint32), ("reserved", ctypes.c_uint32),
+                ("set_input", ctypes.c_void_p), ("get_output", ctypes.c_void_p),
+                ("prepare", ctypes.c_void_p), ("step", ctypes.c_void_p),
+                ("last_error", ctypes.c_void_p)]
+
+
+class ModelV1(ctypes.Structure):
+    _fields_ = [("abi_version", ctypes.c_uint32), ("struct_size", ctypes.c_uint32),
+                ("exp", ctypes.c_void_p),
+                ("ports", ctypes.POINTER(PortDesc)), ("n_ports", ctypes.c_uint64),
+                ("stages", ctypes.POINTER(StageDesc)), ("n_stages", ctypes.c_uint64),
+                ("self_", ctypes.c_void_p), ("verbs", Verbs),
+                ("owner", ctypes.c_void_p),
+                ("retain", ctypes.CFUNCTYPE(None, ctypes.c_void_p)),
+                ("release", ctypes.CFUNCTYPE(None, ctypes.c_void_p))]
+
+
+class ModelV1Tail(ctypes.Structure):
+    _fields_ = ModelV1._fields_ + [("query_extension", ctypes.c_void_p)]
+
+
+class GenericStageDesc(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char_p),
+                ("executor_kind", ctypes.c_uint32),
+                ("executor_ref", ctypes.c_uint32),
+                ("n_after", ctypes.c_uint32),
+                ("after", ctypes.POINTER(ctypes.c_uint32))]
+
+
+class GenericStagePlan(ctypes.Structure):
+    _fields_ = [("abi_version", ctypes.c_uint32),
+                ("struct_size", ctypes.c_uint32),
+                ("stages", ctypes.POINTER(GenericStageDesc)),
+                ("n_stages", ctypes.c_uint64),
+                ("stage_self", ctypes.c_void_p),
+                ("run_opaque", ctypes.c_void_p)]
+
+
+def make_setup():
+    ctx = ex.Ctx()
+    sid = ctx.stream(0)
+    src = ctx.buffer("src", 4096)
+    dst = ctx.buffer("dst", 4096)
+    g = ctx.graph("infer", 1)
+
+    def record(stream):
+        ex.memcpy_async(dst.dptr(), src.dptr(), 4096, stream)
+
+    g.capture(0, record)
+    return ctx, sid, src, dst, g
+
+
+def build(setup, img_h=224, verbs=None):
+    ctx, sid, src, dst, g = setup
+    if verbs is None:
+        verbs = {
+            "set_input": lambda port, payload, stream: 0,
+            "get_output": lambda port, stream: b"",
+        }
+    return build_model_runtime(
+        ctx,
+        streams=[StreamSpec("main", sid)],
+        graphs=[GraphSpec("infer", g, 0, (0,))],
+        buffers=[BufferSpec("src", src, "input"),
+                 BufferSpec("dst", dst, "output")],
+        regions=[RegionSpec("boundary", dst)],
+        ports=[
+            PortSpec("images", "image", "bf16", "nhwc", "in", "staged",
+                     required=True, shape=(1, img_h, 224, 3), cadence_hz=30),
+            PortSpec("obs", "state", "bf16", "flat", "in", "swap",
+                     shape=(32,), buffer=src),
+            PortSpec("actions", "action", "bf16", "flat", "out", "staged",
+                     shape=(4,), buffer=dst),
+        ],
+        stages=[StageSpec("infer")],
+        identity={"model": "trivial", "quant": "none"},
+        **verbs,
+    )
+
+
+def build_split(setup):
+    ctx, sid, src, dst, g = setup
+    plan = StagePlan.context_action()
+    return build_model_runtime(
+        ctx,
+        streams=[StreamSpec("main", sid)],
+        graphs=[
+            GraphSpec("infer", g, 0, (0,)),
+            GraphSpec("context", g, 0, (0,)),
+            GraphSpec("decode_only", g, 0, (0,)),
+        ],
+        buffers=[BufferSpec("src", src, "input"),
+                 BufferSpec("dst", dst, "output")],
+        regions=[RegionSpec("boundary", dst)],
+        ports=[
+            PortSpec("images", "image", "bf16", "nhwc", "in", "staged",
+                     required=True, shape=(1, 224, 224, 3), cadence_hz=30),
+            PortSpec("obs", "state", "bf16", "flat", "in", "swap",
+                     shape=(32,), buffer=src),
+            PortSpec("actions", "action", "bf16", "flat", "out", "staged",
+                     shape=(4,), buffer=dst),
+        ],
+        stages=plan.to_stage_specs(export_mod),
+        identity={"model": "trivial", "quant": "none"},
+        manifest_extra={"stage_plan": plan.manifest()},
+        set_input=lambda port, payload, stream: 0,
+        get_output=lambda port, stream: b"",
+    )
+
+
+def check_staged_callback_guards():
+    original_assemble = export_mod._assemble
+    assemble_calls = 0
+
+    def forbidden_assemble(*args, **kwargs):
+        nonlocal assemble_calls
+        assemble_calls += 1
+        raise AssertionError("_assemble must not run after STAGED validation failure")
+
+    export_mod._assemble = forbidden_assemble
+    try:
+        try:
+            build_model_runtime(
+                None, streams=(), graphs=(),
+                ports=[PortSpec("input", "tensor", "f32", "flat",
+                                "in", "staged", shape=(1,))],
+                identity={"model": "invalid-staged-input"},
+            )
+        except ValueError as exc:
+            input_rejected = str(exc) == "STAGED input ports require set_input"
+        else:
+            input_rejected = False
+
+        try:
+            build_model_runtime(
+                None, streams=(), graphs=(),
+                ports=[PortSpec("output", "tensor", "f32", "flat",
+                                "out", "staged", shape=(1,))],
+                identity={"model": "invalid-staged-output"},
+            )
+        except ValueError as exc:
+            output_rejected = str(exc) == "STAGED output ports require get_output"
+        else:
+            output_rejected = False
+    finally:
+        export_mod._assemble = original_assemble
+
+    check("Python producer rejects STAGED input without set_input",
+          input_rejected)
+    check("Python producer rejects STAGED output without get_output",
+          output_rejected)
+    check("Python STAGED rejection happens before _assemble", assemble_calls == 0)
+
+
+def check_low_level_staged_builder_guard(setup):
+    ctx, _, _, _, _ = setup
+    builder = rt.Builder(ctx.raw())
+    builder.add_identity("model", "low-level-staged-guard")
+    builder.add_port("input", rt.MOD_TENSOR, rt.DTYPE_F32,
+                     rt.LAYOUT_FLAT, rt.PORT_IN, rt.PORT_STAGED,
+                     shape=[1])
+    builder.add_port("output", rt.MOD_TENSOR, rt.DTYPE_F32,
+                     rt.LAYOUT_FLAT, rt.PORT_OUT, rt.PORT_STAGED,
+                     shape=[1])
+
+    class Owner:
+        pass
+
+    missing_input_owner = Owner()
+    missing_input_ref = weakref.ref(missing_input_owner)
+    try:
+        builder.finish_model(
+            missing_input_owner,
+            get_output=lambda port, stream: b"",
+        )
+    except RuntimeError as exc:
+        missing_input_rejected = str(exc) == "finish_model failed"
+    else:
+        missing_input_rejected = False
+    del missing_input_owner
+    gc.collect()
+
+    missing_output_owner = Owner()
+    missing_output_ref = weakref.ref(missing_output_owner)
+    try:
+        builder.finish_model(
+            missing_output_owner,
+            set_input=lambda port, payload, stream: 0,
+        )
+    except RuntimeError as exc:
+        missing_output_rejected = str(exc) == "finish_model failed"
+    else:
+        missing_output_rejected = False
+    del missing_output_owner
+    gc.collect()
+
+    final_owner = Owner()
+    final_owner_ref = weakref.ref(final_owner)
+    ptr = builder.finish_model(
+        final_owner,
+        set_input=lambda port, payload, stream: 0,
+        get_output=lambda port, stream: b"",
+        step=lambda: 0,
+    )
+    del final_owner
+    gc.collect()
+
+    check("low-level builder rejects missing STAGED input",
+          missing_input_rejected)
+    check("low-level builder rejects missing STAGED output",
+          missing_output_rejected)
+    check("low-level failures release owners",
+          missing_input_ref() is None and missing_output_ref() is None)
+    check("low-level builder remains retryable after STAGED rejection",
+          ptr != 0 and final_owner_ref() is not None)
+    rt.model_release(ptr)
+    gc.collect()
+    check("low-level successful retry releases its owner",
+          final_owner_ref() is None)
+
+
+def check_stage_plan_registry():
+    register_stage_plan(
+        "unit_chain",
+        lambda **_: StagePlan.chain(
+            "unit_chain",
+            ("vlm", "vit", "dit_0_4", "dit_5_9", "action_expert"),
+            metadata={"owner": "unit-test", "granularity": "vla-structural"},
+        ),
+        model="unit",
+        replace=True,
+    )
+    plan = resolve_stage_plan("unit_chain", model="unit")
+    manifest = plan.manifest()
+    check("registered model stage plan resolves by name", (
+        manifest["name"] == "unit_chain"
+        and manifest["metadata"]["granularity"] == "vla-structural"
+        and [s["graph"] for s in manifest["stages"]] == [
+            "vlm", "vit", "dit_0_4", "dit_5_9", "action_expert"
+        ]
+        and manifest["stages"][2]["after"] == ["vit"]))
+    specs = plan.to_stage_specs(type("ExportMirror", (), {
+        "StageSpec": StageSpec,
+    }))
+    check("registered chain lowers to ordered stage specs", (
+        len(specs) == 5
+        and specs[0].graph == "vlm" and specs[0].after == ()
+        and specs[4].graph == "action_expert" and specs[4].after == (3,)))
+    check("registry lists global and model-specific plans", (
+        "full" in list_stage_plans(model="unit")
+        and "unit_chain" in list_stage_plans(model="unit")
+        and "unit_chain" not in list_stage_plans()))
+    register_stage_plan(
+        "unit_chunks",
+        lambda *, chunk_size=2, total=4: StagePlan.chain(
+            "unit_chunks",
+            tuple(f"denoise_{i}_{min(i + chunk_size, total) - 1}"
+                  for i in range(0, total, chunk_size)),
+            metadata={"chunk_size": chunk_size, "total": total},
+        ),
+        model="unit",
+        replace=True,
+    )
+    chunked = resolve_stage_plan("unit_chunks", model="unit",
+                                 chunk_size=3, total=8).manifest()
+    check("registered factories accept export-time kwargs", (
+        chunked["metadata"] == {"chunk_size": 3, "total": 8}
+        and [s["graph"] for s in chunked["stages"]] == [
+            "denoise_0_2", "denoise_3_5", "denoise_6_7"
+        ]))
+    from wllm.native.subgraphs.pi05 import stage_plans as _pi05_plans  # noqa: F401
+    vjp = resolve_stage_plan("context_rtc_vjp_guided_action", model="pi05")
+    try:
+        vjp.validate(graph_names=("infer", "context", "decode_only"),
+                     stream_names=("main",))
+    except ValueError as e:
+        missing_vjp = "decode_rtc_vjp_guided" in str(e)
+    else:
+        missing_vjp = False
+    check("VJP-guided RTC plan fails without a producer VJP graph",
+          missing_vjp)
+    class Dummy:
+        pass
+    try:
+        register_export_graph(Dummy(), "bad", object(), variants=())
+    except ValueError as e:
+        empty_variants_rejected = "at least one variant" in str(e)
+    else:
+        empty_variants_rejected = False
+    check("subgraph export rejects empty graph variants",
+          empty_variants_rejected)
+    try:
+        register_export_graph(Dummy(), "bad_stream", object(), stream=1)
+    except ValueError as e:
+        int_stream_rejected = "StreamSpec name" in str(e)
+    else:
+        int_stream_rejected = False
+    check("subgraph export rejects non-main integer stream ids",
+          int_stream_rejected)
+
+
+def check_vjp_guided_port_lowering(setup):
+    ctx, sid, src, dst, g = setup
+    from wllm.native.subgraphs.pi05 import stage_plans as _pi05_plans  # noqa: F401
+    plan = resolve_stage_plan("context_rtc_vjp_guided_action", model="pi05")
+    mr = build_model_runtime(
+        ctx,
+        streams=[StreamSpec("main", sid)],
+        graphs=[
+            GraphSpec("infer", g, stream="main"),
+            GraphSpec("context", g, stream="main"),
+            GraphSpec("decode_rtc_vjp_guided", g, stream="main"),
+        ],
+        buffers=[BufferSpec("prev", src, "input"),
+                 BufferSpec("actions", dst, ("input", "output")),
+                 BufferSpec("weights", src, "input"),
+                 BufferSpec("guidance", src, "input")],
+        regions=[RegionSpec("boundary", dst)],
+        ports=[
+            PortSpec("prev_action_chunk", "tensor", "bf16", "flat", "in",
+                     "swap", shape=(10, 32), buffer=src),
+            PortSpec("actions_raw", "tensor", "bf16", "flat", "out",
+                     "swap", shape=(10, 32), buffer=dst),
+            PortSpec("prefix_weights", "tensor", "f32", "flat", "in",
+                     "swap", shape=(10,), buffer=src, nbytes=40),
+            PortSpec("guidance_weight", "tensor", "f32", "flat", "in",
+                     "swap", shape=(1,), buffer=src, nbytes=4),
+        ],
+        stages=plan.to_stage_specs(export_mod),
+        identity={"model": "pi05", "plan": "context_rtc_vjp_guided_action"},
+        manifest_extra={"stage_plan": plan.manifest()},
+    )
+    try:
+        m = ModelV1.from_address(mr.ptr)
+        guidance = m.ports[3]
+        check("VJP-guided RTC ports lower with ABI-supported flat scalar",
+              guidance.name == b"guidance_weight"
+              and guidance.layout == LAYOUT["flat"]
+              and guidance.rank == 1
+              and guidance.shape[0] == 1
+              and guidance.bytes == 4)
+        check("VJP-guided RTC plan lowers to context -> guided action",
+              mr.stages() == [{"graph": 1, "after": []},
+                              {"graph": 2, "after": [0]}])
+    finally:
+        mr.release()
+
+
+def check_generic_and_metadata(setup):
+    ctx, sid, _, _, g = setup
+    opaque_refs = []
+    def make_generic(executor_ref=91):
+        return build_model_runtime(
+            ctx,
+            streams=[StreamSpec("main", sid)],
+            graphs=[GraphSpec("graph", g)],
+            generic_stages=[
+                GenericStageSpec("graph", "graph", 0),
+                GenericStageSpec("opaque:decode", "opaque", executor_ref,
+                                 after=(0,)),
+            ],
+            identity={"provider": "python-fixture"},
+            step=lambda: 0,
+            run_opaque=lambda ref: opaque_refs.append(ref) or 0,
+        )
+
+    generic = make_generic()
+    try:
+        check("Python generic plan is the sole stage authority",
+              generic.stages() == [] and generic.generic_stages() == [
+                  {"name": "graph", "executor_kind": rt.GENERIC_STAGE_GRAPH,
+                   "executor_ref": 0, "after": []},
+                  {"name": "opaque:decode",
+                   "executor_kind": rt.GENERIC_STAGE_OPAQUE,
+                   "executor_ref": 91, "after": [0]},
+              ])
+        check("Python generic identity is canonical",
+              "gstage-v1:1:13:opaque:decode:1:91:1:0\n" in generic.identity)
+        check("Python OPAQUE trampoline receives executor_ref",
+              rt.model_run_opaque(generic.ptr, 91) == 0 and opaque_refs == [91])
+        same = make_generic()
+        changed = make_generic(92)
+        try:
+            check("generic fingerprint is deterministic and ref-sensitive",
+                  same.fingerprint == generic.fingerprint and
+                  changed.fingerprint != generic.fingerprint)
+        finally:
+            same.release()
+            changed.release()
+    finally:
+        generic.release()
+
+    metadata_refs = []
+    metadata = build_metadata_model_runtime(
+        ports=[PortSpec("input", "tensor", "f32", "flat", "in", "staged",
+                        shape=(1,), required=True)],
+        generic_stages=[GenericStageSpec("infer", "opaque", 7)],
+        identity={"provider": "metadata-fixture"},
+        set_input=lambda port, payload, stream: 0,
+        run_opaque=lambda ref: metadata_refs.append(ref) or 0,
+    )
+    try:
+        check("Python metadata runtime has a zero-resource export anchor",
+              rt.export_counts(metadata.export_ptr) == {
+                  "streams": 0, "graphs": 0, "buffers": 0,
+                  "capsule_regions": 0})
+        check("Python metadata runtime publishes all-OPAQUE plan",
+              metadata.generic_stages() == [
+                  {"name": "infer", "executor_kind": rt.GENERIC_STAGE_OPAQUE,
+                   "executor_ref": 7, "after": []}])
+        check("Python metadata OPAQUE callback runs",
+              rt.model_run_opaque(metadata.ptr, 7) == 0 and metadata_refs == [7])
+    finally:
+        metadata.release()
+
+
+def main():
+    CHECKS.clear()
+    setup = make_setup()
+    ctx, sid, src, dst, g = setup
+
+    print("== struct layout (ctypes mirror vs specs) ==")
+    check("ctypes v1 prefix matches exported required size",
+          ctypes.sizeof(ModelV1) == int(rt.MODEL_V1_BASE_SIZE))
+    check("ctypes v1 tail matches exported query size",
+          ctypes.sizeof(ModelV1Tail) ==
+          int(rt.MODEL_V1_QUERY_EXTENSION_SIZE))
+    check("ctypes generic descriptor/table match C ABI sizes",
+          ctypes.sizeof(GenericStageDesc) == int(rt.GENERIC_STAGE_DESC_V1_SIZE)
+          and ctypes.sizeof(GenericStagePlan) ==
+          int(rt.GENERIC_STAGE_PLAN_EXT_V1_SIZE))
+    check_staged_callback_guards()
+    check_low_level_staged_builder_guard(setup)
+    calls = {"set_input": [], "step": 0}
+
+    def py_set_input(port, payload, stream):
+        calls["set_input"].append((port, bytes(payload), stream))
+        return 0
+
+    def py_get_output(port, stream):
+        if port != 2:
+            raise ValueError("only the actions port is decodable")
+        return b"\x01\x02\x03\x04"
+
+    def py_step():
+        calls["step"] += 1
+        return g.replay(0, sid)
+
+    mr = build(setup, verbs=dict(set_input=py_set_input,
+                                 get_output=py_get_output, step=py_step))
+    m = ModelV1.from_address(mr.ptr)
+    check("abi stamp", m.abi_version == int(rt.MODEL_ABI_VERSION)
+          and m.struct_size >= int(rt.MODEL_V1_BASE_SIZE))
+    check("embedded export pointer", m.exp == mr.export_ptr)
+    check("port count", m.n_ports == 3 and m.n_stages == 1)
+    p0 = m.ports[0]
+    check("port desc round-trips", (
+        p0.name == b"images" and p0.modality == MODALITY["image"]
+        and p0.dtype == DTYPE["bf16"] and p0.update == UPDATE["staged"]
+        and p0.required == 1 and p0.rank == 4 and p0.shape[1] == 224
+        and p0.cadence_hint_hz == 30))
+    check("swap port exposes the device window", (
+        m.ports[1].update == UPDATE["swap"]
+        and m.ports[1].buffer == src.raw()
+        and m.ports[1].bytes == 4096))
+    check("stage desc", m.stages[0].graph == 0 and m.stages[0].n_after == 0)
+    check("introspection matches the mirror", (
+        mr.ports()[0]["name"] == "images"
+        and mr.stages() == [{"graph": 0, "after": []}]))
+
+    print("== identity / fingerprint ==")
+    check("identity carries port + stage records", (
+        "port:0:images:" in mr.identity and "stage:0:0:" in mr.identity))
+    mr2 = build(setup, img_h=256)
+    check("port shape change changes the fingerprint",
+          mr2.fingerprint != mr.fingerprint)
+    mr2.release()
+    split = build_split(setup)
+    check("context_action stage plan exports two ordered stages", (
+        split.stages() == [{"graph": 1, "after": []},
+                           {"graph": 2, "after": [0]}]))
+    check("stage plan change changes the fingerprint",
+          split.fingerprint != mr.fingerprint)
+    split.release()
+
+    print("== stage plan registry ==")
+    check_stage_plan_registry()
+    check_vjp_guided_port_lowering(setup)
+    check_generic_and_metadata(setup)
+
+    print("== verbs through the C function pointers ==")
+    rc = rt.model_set_input(mr.ptr, 1, b"\xAA\xBB", -1)
+    check("set_input reaches the Python callable",
+          rc == 0 and calls["set_input"] == [(1, b"\xAA\xBB", -1)])
+    rc, payload, written = rt.model_get_output(mr.ptr, 2, 16, -1)
+    check("get_output returns the producer's bytes",
+          rc == 0 and payload == b"\x01\x02\x03\x04" and written == 4)
+    rc, _, written = rt.model_get_output(mr.ptr, 2, 2, -1)
+    check("get_output reports the needed size on short buffers",
+          rc == -5 and written == 4)
+    rc, _, _ = rt.model_get_output(mr.ptr, 0, 16, -1)
+    check("producer exceptions become status + last_error",
+          rc == -1 and "actions port" in rt.model_last_error(mr.ptr))
+    check("step replays through the producer",
+          rt.model_step(mr.ptr) == 0 and calls["step"] == 1)
+
+    print("== lifetime ==")
+    anchor_ref = weakref.ref(mr._anchor)
+    rt.model_retain(mr.ptr)          # the "consumer" adopts
+    ptr = mr.ptr
+    mr._anchor = None
+    mr.release()                      # producer drops its reference
+    gc.collect()
+    check("consumer retain keeps the anchor alive", anchor_ref() is not None)
+    rt.model_release(ptr)             # consumer done
+    gc.collect()
+    check("final release frees the anchor", anchor_ref() is None)
+
+    failed = [n for n, ok in CHECKS if not ok]
+    print(f"\n{len(CHECKS) - len(failed)}/{len(CHECKS)} checks passed")
+    if failed:
+        raise SystemExit("FAILED: " + ", ".join(failed))
+    print("PASS — Python-produced model runtime: layout, identity, verbs, lifetime")
+
+
+if __name__ == "__main__":
+    main()
+
+
+def test_main():
+    main()

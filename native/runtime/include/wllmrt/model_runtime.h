@@ -1,0 +1,372 @@
+/* wLLM Model Runtime — public C ABI (v1).
+ *
+ * The standard face of one DEPLOYED, TICKABLE model. It wraps the runtime
+ * export (wllmrt/runtime.h — the frozen execution/state kernel) and adds the
+ * dynamic-IO contract a production tick needs:
+ *
+ *   dynamic inputs -> standardized update -> replay -> standardized outputs
+ *
+ * The contract is DATA FIRST, VERBS AS SUGAR:
+ *   - `ports`  declare every dynamic input/output: modality, dtype, shape,
+ *     layout, direction, and — the load-bearing part — the UPDATE CLASS.
+ *   - `stages` declare the subgraph DAG (indices into the export's graphs +
+ *     dependency edges). A white-box host schedules stages itself with the
+ *     export handles; `step` merely fires them in declared order.
+ *   - four verbs cover what data alone cannot: staged input transform,
+ *     transformed output readback, warm-phase variant preparation, and the
+ *     one-call tick.
+ *
+ * Update classes (the two-speed hot path):
+ *   WRT_RT_PORT_SWAP   : the port IS a device-buffer window. The host writes
+ *                        raw bytes directly (its own copy verb / cap_swap) —
+ *                        zero model code in the loop. Microsecond lane.
+ *   WRT_RT_PORT_STAGED : the model runtime's `set_input` transforms host data
+ *                        (tokenize / resize / normalize / embed) into bound
+ *                        buffers, optionally firing a micro-graph.
+ *   WRT_RT_PORT_SETUP  : legal only outside the tick (weights, calibration).
+ * A STAGED declaration is a PROMISE: the port accepts hot updates. A producer
+ * that cannot update an input in the hot phase declares SETUP or omits the
+ * port — never advertise-and-refuse.
+ *
+ * Production contract for BOTH hot classes (SWAP, STAGED) — conformance
+ * suites pin these down:
+ *   - never recapture a graph, never allocate, never rebind graph pointers;
+ *     only buffer CONTENTS change (the graph-safe mutation discipline);
+ *   - replay graphs are fixed-shape or shape-bucket-keyed; a shape bucket
+ *     miss is handled by `prepare` in the WARM phase, never inside a tick.
+ *
+ * Two producers, one struct (mirroring the export):
+ *   today : assembled by the export builder (Python setup or native C++);
+ *   later : a native model-runtime .so exports WRT_MODEL_RUNTIME_OPEN_V1_SYMBOL.
+ * Consumers (e.g. a capsule/state host) never learn the model, the producer
+ * language, or the transform internals.
+ *
+ * Design rationale: docs/runtime_contract.md
+ */
+#ifndef WLLM_MODEL_RUNTIME_H
+#define WLLM_MODEL_RUNTIME_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "wllmrt/runtime.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define WRT_MODEL_RUNTIME_ABI_VERSION 1u
+
+/* ------------------------------------------------------------------ */
+/* Enums — values are ABI-frozen after v1 (append-only).               */
+/* ------------------------------------------------------------------ */
+
+enum wrt_rt_modality {
+    WRT_RT_MOD_TENSOR = 0,   /* raw tensor per declared dtype/shape        */
+    WRT_RT_MOD_IMAGE  = 1,   /* payload: wrt_image_view[]                  */
+    WRT_RT_MOD_TEXT   = 2,   /* payload: UTF-8 bytes (no NUL required)     */
+    WRT_RT_MOD_STATE  = 3,   /* proprioception / numeric state (as TENSOR) */
+    WRT_RT_MOD_ACTION = 4,   /* action chunk (as TENSOR)                   */
+    WRT_RT_MOD_AUDIO  = 5,   /* PCM per declared dtype/shape               */
+    WRT_RT_MOD_DEPTH  = 6,   /* payload: wrt_image_view[] (single channel) */
+    WRT_RT_MOD_FORCE  = 7    /* force/torque (as TENSOR)                   */
+};
+
+enum wrt_rt_dtype {
+    WRT_RT_DTYPE_U8   = 0,
+    WRT_RT_DTYPE_F32  = 1,
+    WRT_RT_DTYPE_F16  = 2,
+    WRT_RT_DTYPE_BF16 = 3,
+    WRT_RT_DTYPE_I32  = 4,
+    WRT_RT_DTYPE_I64  = 5
+};
+
+enum wrt_rt_layout {
+    WRT_RT_LAYOUT_FLAT = 0,
+    WRT_RT_LAYOUT_HWC  = 1,
+    WRT_RT_LAYOUT_NHWC = 2,
+    WRT_RT_LAYOUT_CHW  = 3,
+    WRT_RT_LAYOUT_NCHW = 4
+};
+
+enum wrt_rt_pixel_format {
+    WRT_RT_PIXEL_RGB8  = 0,
+    WRT_RT_PIXEL_BGR8  = 1,
+    WRT_RT_PIXEL_RGBA8 = 2,
+    WRT_RT_PIXEL_BGRA8 = 3,
+    WRT_RT_PIXEL_GRAY8 = 4
+};
+
+enum wrt_rt_port_direction { WRT_RT_PORT_IN = 0, WRT_RT_PORT_OUT = 1 };
+
+enum wrt_rt_port_update {
+    WRT_RT_PORT_SWAP   = 0,
+    WRT_RT_PORT_STAGED = 1,
+    WRT_RT_PORT_SETUP  = 2
+};
+
+enum wrt_generic_stage_executor_kind_v1 {
+    WRT_GENERIC_STAGE_GRAPH  = 0,
+    WRT_GENERIC_STAGE_OPAQUE = 1
+};
+
+#define WRT_GENERIC_STAGE_NAME_MAX_BYTES 255u
+#define WRT_GENERIC_STAGE_PLAN_ABI_VERSION 1u
+#define WRT_EXT_GENERIC_STAGE_PLAN_V1 UINT64_C(0x0000000000000001)
+
+/* ------------------------------------------------------------------ */
+/* Payload types (STAGED lane).                                        */
+/* ------------------------------------------------------------------ */
+
+/* One sensor frame handed to an IMAGE/DEPTH port. `set_input` receives an
+ * array of these; `bytes` of the call = n_frames * sizeof(wrt_image_view).
+ * Frames are matched to the model's camera views POSITIONALLY, in the view
+ * order the producer declared (see the port's manifest entry). */
+typedef struct wrt_image_view {
+    uint32_t struct_size;      /* = sizeof(wrt_image_view)                 */
+    uint32_t pixel_format;     /* enum wrt_rt_pixel_format                 */
+    const void* data;          /* host pixels                              */
+    uint64_t bytes;
+    int32_t width, height, stride_bytes;
+    uint32_t reserved;
+    uint64_t timestamp_ns;
+} wrt_image_view;
+
+/* ------------------------------------------------------------------ */
+/* Descriptors. Strings/arrays are owned by the runtime object and     */
+/* stay valid while the consumer holds a reference.                    */
+/* ------------------------------------------------------------------ */
+
+typedef struct wrt_runtime_port_desc {
+    const char* name;          /* "images", "prompt", "state", "actions"   */
+    uint32_t modality;         /* wrt_rt_modality                          */
+    uint32_t dtype;            /* wrt_rt_dtype (of the DEVICE-side tensor) */
+    uint32_t layout;           /* wrt_rt_layout                            */
+    uint32_t direction;        /* wrt_rt_port_direction                    */
+    uint32_t update;           /* wrt_rt_port_update                       */
+    uint32_t required;         /* must be written before the first tick    */
+    const int64_t* shape;      /* declared port tensor dims; for STAGED
+                                * outputs this is the host-visible payload,
+                                * not necessarily the raw bound buffer shape;
+                                * -1 = bucket-variable                     */
+    uint32_t rank;
+    uint32_t cadence_hint_hz;  /* expected update rate; 0 = unknown. Hint,
+                                * not contract — scheduling stays host-side */
+    /* SWAP fast lane: the device window the host writes/reads directly.
+     * Null buffer = STAGED-only port (no raw window is exposed). */
+    wrt_buffer buffer;
+    uint64_t offset, bytes;
+} wrt_runtime_port_desc;
+
+/* One schedulable stage = one export graph + dependency edges. Declared
+ * array order is the sequential firing order `step` uses; `after` lists
+ * stage indices that must complete first (for hosts that overlap stages
+ * across streams). */
+typedef struct wrt_runtime_stage_desc {
+    uint32_t graph;            /* index into exp->graphs                   */
+    uint32_t n_after;
+    const uint32_t* after;     /* stage indices                            */
+} wrt_runtime_stage_desc;
+
+/* Generic selected-plan descriptors. Unlike extension tables, array elements
+ * have frozen size/stride and must not receive additive tail fields. */
+typedef struct wrt_generic_stage_desc_v1 {
+    const char* name;
+    uint32_t executor_kind;
+    uint32_t executor_ref;
+    uint32_t n_after;
+    const uint32_t* after;
+} wrt_generic_stage_desc_v1;
+
+typedef struct wrt_generic_stage_plan_ext_v1 {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    const wrt_generic_stage_desc_v1* stages;
+    uint64_t n_stages;
+    void* stage_self;
+    int (*run_opaque)(void* stage_self, uint32_t executor_ref);
+} wrt_generic_stage_plan_ext_v1;
+
+#define WRT_GENERIC_STAGE_PLAN_EXT_V1_SIZE \
+    ((uint32_t)(offsetof(wrt_generic_stage_plan_ext_v1, run_opaque) + \
+                sizeof(((wrt_generic_stage_plan_ext_v1*)0)->run_opaque)))
+
+/* ------------------------------------------------------------------ */
+/* Verbs — implemented by the producer, called by the host.            */
+/* set_input / get_output are HOT (contract above); prepare is WARM;   */
+/* step is sugar over the stage list. The construction paths fill any  */
+/* verb the producer omits with an unsupported stub (returns -3), so   */
+/* every entry is always callable — never a null pointer.              */
+/* ------------------------------------------------------------------ */
+typedef struct wrt_model_runtime_verbs {
+    uint32_t struct_size;      /* = sizeof(wrt_model_runtime_verbs)        */
+    uint32_t reserved;
+
+    /* Write one input port. `data` is interpreted per the port's modality
+     * (see payload conventions above). `stream` = an exp stream_id, or -1
+     * for the port's default. Never recaptures/allocates/rebinds. */
+    int (*set_input)(void* self, uint32_t port,
+                     const void* data, uint64_t bytes, int stream);
+
+    /* Read one output port through the producer's postprocess (e.g. action
+     * unnormalize). `capacity`/`written` are BYTES. Raw readback needs no
+     * verb — use the port's buffer. */
+    int (*get_output)(void* self, uint32_t port,
+                      void* out, uint64_t capacity, uint64_t* written,
+                      int stream);
+
+    /* WARM phase only: ensure graph `graph` (exp index) has a variant for
+     * `key` (capture-on-miss for shape buckets). Never call inside a tick. */
+    int (*prepare)(void* self, uint32_t graph, wrt_shape_key key);
+
+    /* Sugar: fire all stages in declared order on their declared streams.
+     * Hosts that schedule/overlap/interrupt fire stages themselves. */
+    int (*step)(void* self);
+
+    const char* (*last_error)(void* self);
+} wrt_model_runtime_verbs;
+
+/* ABI-frozen in v1. Do not append fields here: this table is embedded in the
+ * middle of wrt_model_runtime_v1, so growing it would move owner/retain/release
+ * and break the v1 prefix. New optional entry points belong in an additive
+ * tail on wrt_model_runtime_v1 itself. */
+
+/* ------------------------------------------------------------------ */
+/* The model runtime object.                                           */
+/* ------------------------------------------------------------------ */
+struct wrt_model_runtime_v1;
+
+/* Optional capabilities are discovered through an additive tail instead of
+ * growing the ABI-frozen verbs table. Consumers must probe the runtime's
+ * struct_size before reading this function pointer. */
+typedef int (*wrt_model_runtime_query_extension_fn)(
+    const struct wrt_model_runtime_v1* runtime,
+    uint64_t extension_id,
+    uint32_t min_version,
+    const void** out_extension);
+
+typedef struct wrt_model_runtime_v1 {
+    uint32_t abi_version;      /* = WRT_MODEL_RUNTIME_ABI_VERSION          */
+    uint32_t struct_size;      /* = sizeof(wrt_model_runtime_v1)           */
+
+    /* The execution/state kernel. Snapshot/restore/replay/regions all live
+     * here, unchanged. */
+    const wrt_runtime_export_v1* exp;
+
+    const wrt_runtime_port_desc*  ports;  uint64_t n_ports;
+    const wrt_runtime_stage_desc* stages; uint64_t n_stages;
+
+    void* self;                /* passed to every verb                     */
+    wrt_model_runtime_verbs verbs;
+
+    /* Lifetime. The consumer retains/releases ONLY this object; the owner
+     * holds one export reference internally. Thread-safe; a Python producer
+     * handles GIL acquisition inside release. */
+    void* owner;
+    void (*retain)(void* owner);
+    void (*release)(void* owner);
+
+    /* Additive v1 tail. Baseline-prefix producers end before this field. */
+    wrt_model_runtime_query_extension_fn query_extension;
+} wrt_model_runtime_v1;
+
+/* Minimum byte prefix every v1 consumer may require. Keep this anchored to
+ * the last v1 field instead of sizeof(wrt_model_runtime_v1): future additive
+ * tail fields must remain optional for baseline-prefix producers and invisible
+ * to prefix-only consumers. Read a tail only after probing its required size. */
+#define WRT_MODEL_RUNTIME_V1_BASE_SIZE \
+    ((uint32_t)(offsetof(wrt_model_runtime_v1, release) + \
+                sizeof(((wrt_model_runtime_v1*)0)->release)))
+
+#define WRT_MODEL_RUNTIME_V1_QUERY_EXTENSION_SIZE \
+    ((uint32_t)(offsetof(wrt_model_runtime_v1, query_extension) + \
+                sizeof(((wrt_model_runtime_v1*)0)->query_extension)))
+
+/* Factory symbol convention for NATIVE model runtimes: a model-runtime .so
+ * exports exactly this symbol. Returns a retained object (caller releases). */
+#define WRT_MODEL_RUNTIME_OPEN_V1_SYMBOL "wrt_model_runtime_open_v1"
+typedef int (*wrt_model_runtime_open_v1_fn)(const char* config_json,
+                                            wrt_model_runtime_v1** out);
+
+/* ------------------------------------------------------------------ */
+/* Construction path 1 — INTEGRATED (preferred): the export builder    */
+/* assembles export + ports + stages in one identity. Port and stage   */
+/* records join the canonical identity string, so a port-schema change */
+/* changes the fingerprint (a schema change means the captured IO      */
+/* surface changed; stored state must be refused). A port's identity   */
+/* covers its schema AND its bound window (buffer index/offset/bytes); */
+/* only cadence_hint_hz stays out — it is advisory, not contract.      */
+/* ------------------------------------------------------------------ */
+int wrt_runtime_builder_add_port(wrt_runtime_builder, const char* name,
+                                 uint32_t modality, uint32_t dtype,
+                                 uint32_t layout, uint32_t direction,
+                                 uint32_t update, uint32_t required,
+                                 const int64_t* shape, uint32_t rank,
+                                 uint32_t cadence_hint_hz,
+                                 wrt_buffer buffer, uint64_t offset,
+                                 uint64_t bytes);
+int wrt_runtime_builder_add_stage(wrt_runtime_builder, uint32_t graph,
+                                  const uint32_t* after, uint32_t n_after);
+int wrt_runtime_builder_add_generic_stage(
+    wrt_runtime_builder, const char* name, uint32_t executor_kind,
+    uint32_t executor_ref, const uint32_t* after, uint32_t n_after);
+int wrt_runtime_builder_set_generic_stage_runner(
+    wrt_runtime_builder, void* stage_self,
+    int (*run_opaque)(void* stage_self, uint32_t executor_ref));
+
+/* Create a model-only builder for a provider that owns no wLLM execution
+ * resources. Its export remains the identity/lifetime anchor, with null ctx
+ * and zero resource arrays. The builder is deliberately restricted to
+ * identity/manifest, unbound STAGED or SETUP ports, and all-OPAQUE generic or
+ * step-only authority. */
+wrt_runtime_builder wrt_model_runtime_builder_create_metadata(void);
+
+/* Like wrt_runtime_builder_finish, but returns the model runtime whose
+ * `exp` is the internally-built export (one object, one refcount). `verbs`
+ * is copied; entries may be null except that every STAGED input requires a
+ * real set_input and every STAGED output requires a real get_output. A
+ * contract-validation failure returns null without consuming the builder or
+ * retaining owner; success consumes the builder. */
+wrt_model_runtime_v1* wrt_runtime_builder_finish_model(
+    wrt_runtime_builder,
+    const wrt_model_runtime_verbs* verbs, void* verbs_self,
+    void* owner, void (*retain_owner)(void*), void (*release_owner)(void*));
+
+/* ------------------------------------------------------------------ */
+/* Construction path 2 — ADAPTER: wrap an EXISTING export with ports   */
+/* and verbs (e.g. a native C++ model runtime over a Python-built      */
+/* export). Identity/fingerprint are inherited from the export — ports */
+/* are NOT re-fingerprinted on this path; prefer path 1 when the same  */
+/* producer builds both. Descriptor arrays are copied. The wrapper     */
+/* takes one export reference and calls `wrapper_release(wrapper_owner)`*/
+/* exactly once when its refcount hits zero (use it to destroy the     */
+/* producer instance behind `verbs_self`). STAGED declarations require */
+/* matching input/output verbs, as on construction path 1.             */
+/* ------------------------------------------------------------------ */
+wrt_model_runtime_v1* wrt_model_runtime_wrap(
+    const wrt_runtime_export_v1* exp,
+    const wrt_runtime_port_desc* ports, uint64_t n_ports,
+    const wrt_runtime_stage_desc* stages, uint64_t n_stages,
+    const wrt_model_runtime_verbs* verbs, void* verbs_self,
+    void* wrapper_owner, void (*wrapper_release)(void*));
+
+/* ------------------------------------------------------------------ */
+/* Construction path 3 — VERB OVERRIDE: keep an existing model runtime */
+/* declaration (export + ports + stages) and replace only the verbs.   */
+/* This is the clean hand-off when one producer owns capture/schema and */
+/* a native runtime owns hot-path transforms. The override retains `in` */
+/* so all inherited descriptor pointers stay valid; consumers release   */
+/* only the returned object. `retain_owner`/`release_owner` manage the  */
+/* native verb object, called once at construction/destruction. The new */
+/* verbs must satisfy every inherited STAGED input/output declaration.   */
+/* ------------------------------------------------------------------ */
+wrt_model_runtime_v1* wrt_model_runtime_override_verbs(
+    const wrt_model_runtime_v1* in,
+    const wrt_model_runtime_verbs* verbs, void* verbs_self,
+    void* owner, void (*retain_owner)(void*), void (*release_owner)(void*));
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
+
+#endif /* WLLM_MODEL_RUNTIME_H */

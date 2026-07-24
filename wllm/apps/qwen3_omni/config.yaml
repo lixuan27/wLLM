@@ -1,0 +1,75 @@
+# Sequential reference Qwen3-Omni worker config.
+#
+# The Qwen3-Omni pipeline has three components run by the user worker:
+#   - Thinker  : vllm-omni single-stage AsyncOmni engine (subprocess).
+#   - Talker   : in-process Qwen3OmniTalkerRunner reusing vLLM-Omni's
+#                native Talker module, CodePredictor, kernels, and loader.
+#   - Code2Wav : vllm-omni single-stage AsyncOmni engine (subprocess).
+
+seed: 42
+
+# Channel names (the adapter must use the same values).
+ctrl_buffer_name: qwen3_omni_ctrl
+text_input_buffer_name: qwen3_omni_text_input
+audio_output_buffer_name: qwen3_omni_audio_output
+audio_meta_buffer_name: qwen3_omni_audio_meta
+
+# Audio buffer sizing (24 kHz mono is the Qwen3-Omni default).
+audio_sample_rate: 24000
+audio_frame_samples: 960
+audio_max_chunks: 8192
+text_max_pending: 16
+
+# total_upsample for the Qwen3-Omni vocoder. Computed as
+# `prod(code2wav_config.upsample_rates + code2wav_config.upsampling_ratios)`
+# = prod([8,5,4,3,2,2]) = 1920 for Qwen3-Omni, so the codec frame rate
+# is 24000/1920 = 12.5 Hz.
+audio_samples_per_codec_frame: 1920
+
+# Conditioning passed to the Talker.
+speaker: chelsie
+language: en
+
+# System prompt prepended to the user text. Override per-deployment.
+system_prompt: |-
+  You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group,
+  capable of perceiving auditory and visual inputs, as well as generating
+  text and speech.
+
+# Optional sampling overrides (defaults match Qwen3-Omni reference).
+sampling:
+  thinker_max_tokens: 2048
+  thinker_temperature: 0.4
+  thinker_top_p: 0.9
+  thinker_top_k: 1
+  thinker_repetition_penalty: 1.05
+  talker_max_tokens: 4096
+  talker_max_seq_len: 8192
+  talker_temperature: 0.9
+  talker_top_k: 50
+  talker_top_p: 1.0
+  talker_repetition_penalty: 1.05
+  code2wav_max_tokens: 65536
+  code2wav_temperature: 0.0
+  code2wav_top_p: 1.0
+  code2wav_repetition_penalty: 1.1
+
+# Per-component launch parameters. ``gpu_index`` for the Thinker /
+# Code2Wav engines selects the physical GPU each AsyncOmni subprocess
+# pins to; for the in-process Talker it selects the parent's
+# ``cuda:N``. Use distinct gpu_index values for the engines so they
+# don't compete for HBM (Talker can share with Code2Wav -- it's small).
+
+thinker:
+  model_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+  stage_configs_path: wllm/configs/qwen3_omni/thinker_only.yaml
+  gpu_index: 0
+
+talker:
+  model_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+  gpu_index: 1
+
+code2wav:
+  model_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+  stage_configs_path: wllm/configs/qwen3_omni/code2wav_only.yaml
+  gpu_index: 1

@@ -1,0 +1,26 @@
+"""Qwen3.6 agent-serving policy layer.
+
+This package intentionally lives above the wLLM execution contract:
+sessions, prefix reuse, tool-calling, streaming, and scheduling are serving
+policy.  The lower exec layer remains Buffer/Graph/Plan/Event only.
+"""
+
+from .prefix import PrefixMatch, longest_common_prefix
+from .qwen36_engine import Qwen36FrontendAgentEngine
+from .service import AgentRequest, AgentResult, AgentService
+from .session import PrefixPlan, SessionRecord, SessionRegistry
+from .tool_stream import StreamEvent, ToolCallStreamParser
+
+__all__ = [
+    "AgentRequest",
+    "AgentResult",
+    "AgentService",
+    "PrefixMatch",
+    "PrefixPlan",
+    "Qwen36FrontendAgentEngine",
+    "SessionRecord",
+    "SessionRegistry",
+    "StreamEvent",
+    "ToolCallStreamParser",
+    "longest_common_prefix",
+]

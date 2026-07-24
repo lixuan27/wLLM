@@ -1,0 +1,14 @@
+wLLM: World and Multimodal Model Serving
+Copyright (c) 2026 the wLLM authors
+
+This distribution integrates, with modification and renaming authorized by
+the code owner, two prior in-house codebases of the repository owner:
+  - a real-time multimodal serving runtime and application suite
+    (wllm/serving, wllm/apps, wllm/kernels_t, examples_rt)
+  - a static-graph native inference engine and kernel library
+    (wllm/native, wllm/native_wm, native/), originally released under the
+    Apache License 2.0 (see native/LICENSE.upstream)
+
+Third-party components retain their original notices, including code
+derived from vLLM (Apache-2.0), FlashAttention (BSD-3), CUTLASS
+(BSD-3), and FlashInfer (Apache-2.0), in their respective files.

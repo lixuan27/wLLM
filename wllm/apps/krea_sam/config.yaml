@@ -1,0 +1,48 @@
+model_name: KreaRealtimeTransformer3DModel
+text_encoder_name: UMT5EncoderModel
+vae_name: AutoencoderKLWan
+device: cuda
+dtype: bfloat16
+kv_dtype: bfloat16
+seed: 42
+prompt: cinematic watercolor portrait lighting over a live webcam feed
+tokenizer_path: checkpoints/wan/tokenizer
+text_encoder_path: checkpoints/wan/text_encoder
+transformer_path: checkpoints/krea-realtime-video/transformer
+vae_path: checkpoints/wan/vae-2.1
+
+max_sequence_length: 512
+max_num_frames: 4096
+height: 480
+width: 832
+num_videos_per_prompt: 1
+num_inference_steps: 4
+chunk_size: 3
+first_chunk_size: 3
+context_window_size: 3
+kv_cond_tokens: 0
+continuous_decoding: true
+reactive_decoding: false
+stabilization_level: 15
+guidance_scale: 1.0
+
+denoising_strength: 0.8
+timestep_shift: 5.0
+keep_first_frame: true
+
+attention_backend: auto
+kv_memory: preallocated
+use_cuda_graph: false
+
+video_buffer_name: krea_sam_video
+video_input_buffer_name: krea_sam_video_input
+ctrl_buffer_name: krea_sam_ctrl
+video_input_max_frames: 512
+video_fps: 30
+
+# --- SAM 3 (background-only style transfer) ---
+sam_text_prompt: person
+sam_min_score: 0.5
+sam_mask_threshold: 0.5
+sam_dilate_pixels: 3
+sam_disable: false

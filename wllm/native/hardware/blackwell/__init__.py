@@ -1,0 +1,12 @@
+"""wLLM — Blackwell (SM120+) hardware-specific backend.
+
+Reserved for future Blackwell-only code paths (e.g. NVFP4/W4A8 block-scaled
+GEMMs, DSMEM, SM120a-specific CUTLASS templates).
+
+The Pi0.5 consumer-GPU path (5090 / 4090) now lives in
+``wllm_native.hardware.rtx`` — that module targets SM89+ discrete GPUs with
+the same kernel + frontend structure as ``wllm_native.hardware.thor``, and
+the rtx pipeline auto-enables FP8 / NVFP4 where the hardware supports it.
+"""
+
+__all__: list[str] = []

@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Wan2.2 TI2V-5B official-pipeline quickstart."""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import sys
+import time
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import wllm_native
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", required=True,
+                        help="Path to Wan2.2-TI2V-5B checkpoint directory")
+    parser.add_argument("--prompt", default=(
+        "A cinematic shot of a blue sphere rolling across a wooden table"))
+    parser.add_argument("--negative-prompt", default=None)
+    parser.add_argument("--mode", choices=("t2v", "i2v"), default="t2v")
+    parser.add_argument("--image", default=None,
+                        help="Input image for i2v mode")
+    parser.add_argument("--width", type=int, default=832)
+    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--frames", type=int, default=81)
+    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--shift", type=float, default=5.0)
+    parser.add_argument("--guide-scale", type=float, default=5.0)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--teacache", action="store_true",
+                        help="Enable Wan2.2 TeaCache acceleration")
+    parser.add_argument("--teacache-threshold", type=float, default=0.0)
+    parser.add_argument("--teacache-start-step", type=int, default=1)
+    parser.add_argument("--teacache-end-step", type=int, default=-1)
+    parser.add_argument("--teacache-cache-device", default="cuda",
+                        choices=("cuda", "cpu", "main_device",
+                                 "offload_device"))
+    parser.add_argument("--out", default="wan22_out.mp4")
+    args = parser.parse_args()
+
+    image = None
+    if args.mode == "i2v":
+        if args.image is None:
+            raise SystemExit("--image is required for --mode i2v")
+        from PIL import Image
+        image = Image.open(args.image).convert("RGB")
+
+    t0 = time.perf_counter()
+    model = wllm_native.load_model(
+        args.checkpoint,
+        framework="torch",
+        config="wan22_ti2v_5b",
+        hardware="rtx_sm120",
+    )
+    print(f"[wan22] load_model wall={time.perf_counter() - t0:.2f}s")
+
+    model.set_prompt(args.prompt, negative_prompt=args.negative_prompt)
+    result = model.infer(
+        mode=args.mode,
+        image=image,
+        width=args.width,
+        height=args.height,
+        frames=args.frames,
+        steps=args.steps,
+        shift=args.shift,
+        guide_scale=args.guide_scale,
+        seed=args.seed,
+        teacache=args.teacache,
+        teacache_threshold=args.teacache_threshold,
+        teacache_start_step=args.teacache_start_step,
+        teacache_end_step=args.teacache_end_step,
+        teacache_cache_device=args.teacache_cache_device,
+        save_path=args.out,
+        return_metadata=True,
+    )
+    meta = result["metadata"]
+    print(f"[wan22] infer={meta['infer_seconds']:.2f}s "
+          f"peak={meta['peak_allocated_gib']:.2f} GiB")
+    if meta["teacache"]["enabled"]:
+        tc = meta["teacache"]
+        print("[wan22] teacache "
+              f"threshold={tc['threshold']} "
+              f"cond_skipped={len(tc['cond_skipped'])} "
+              f"uncond_skipped={len(tc['uncond_skipped'])}")
+    print(f"[wan22] saved {pathlib.Path(args.out)}")
+
+
+if __name__ == "__main__":
+    main()

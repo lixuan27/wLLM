@@ -1,0 +1,211 @@
+#include "wllmrt/cpp/models/pi05/c_api.h"
+
+#include "config_map.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <exception>
+#include <memory>
+#include <new>
+#include <string>
+#include <utility>
+#include <vector>
+
+struct wrt_pi05_runtime_s {
+    std::unique_ptr<wllm::models::pi05::Runtime> runtime;
+    std::string last_error;
+    std::vector<wllm::modalities::VisionFrame> vision_frames;
+    std::vector<std::uint8_t> vision_seen;
+    std::vector<float> action_values;
+};
+
+namespace {
+
+using wllm::models::pi05::cface::make_config;
+using wllm::models::pi05::cface::pixel_channels;
+using wllm::models::pi05::cface::pixel_format;
+using wllm::models::pi05::cface::status_code;
+using wllm::models::pi05::cface::valid_pixel_format;
+
+}  // namespace
+
+extern "C" int wrt_pi05_runtime_create(
+    const wrt_runtime_export_v1* exp,
+    const wrt_pi05_runtime_config* config,
+    wrt_pi05_runtime** out) {
+    if (!exp || !out) return -1;
+    *out = nullptr;
+    constexpr std::size_t kConfigRequiredSize =
+        offsetof(wrt_pi05_runtime_config, image_dtype);
+    if (config && config->struct_size < kConfigRequiredSize) {
+        return -1;
+    }
+    auto* h = new (std::nothrow) wrt_pi05_runtime_s();
+    if (!h) return -5;
+    try {
+        auto runtime_config = make_config(config);
+        runtime_config.strict_rgb8 = false;
+        h->runtime.reset(
+            new wllm::models::pi05::Runtime(exp, std::move(runtime_config)));
+    } catch (const std::exception& e) {
+        h->last_error = e.what();
+        delete h;
+        return -6;
+    } catch (...) {
+        delete h;
+        return -6;
+    }
+    if (!h->runtime->ok()) {
+        h->last_error = h->runtime->status().message;
+        int rc = status_code(h->runtime->status());
+        delete h;
+        return rc;
+    }
+    const auto& manifest = h->runtime->manifest();
+    h->vision_frames.resize(manifest.vision.view_order.size());
+    h->vision_seen.resize(manifest.vision.view_order.size());
+    for (std::size_t i = 0; i < h->vision_frames.size(); ++i) {
+        h->vision_frames[i].name = manifest.vision.view_order[i];
+    }
+    h->action_values.resize(static_cast<std::size_t>(
+        manifest.action.chunk * manifest.action.robot_dim));
+    *out = h;
+    return 0;
+}
+
+extern "C" void wrt_pi05_runtime_destroy(wrt_pi05_runtime* h) {
+    delete h;
+}
+
+extern "C" int wrt_pi05_runtime_set_prompt(wrt_pi05_runtime* h,
+                                           const char* text) {
+    if (!h || !h->runtime) return -1;
+    int rc = h->runtime->set_prompt(text);
+    if (rc != 0) {
+        const auto& st = h->runtime->prompt_status();
+        h->last_error = st.message.empty()
+                            ? "prompt updates are not supported by this Pi05 runtime"
+                            : st.message;
+    } else {
+        h->last_error.clear();
+    }
+    return rc;
+}
+
+extern "C" int wrt_pi05_runtime_set_prompt_state(
+    wrt_pi05_runtime* h,
+    const char* text,
+    const float* state,
+    uint64_t n_state) {
+    if (!h || !h->runtime || (!state && n_state)) return -1;
+    int rc = h->runtime->set_prompt_state(text, state, n_state);
+    if (rc != 0) {
+        const auto& st = h->runtime->prompt_status();
+        h->last_error = st.message.empty()
+                            ? "prompt updates are not supported by this Pi05 runtime"
+                            : st.message;
+    } else {
+        h->last_error.clear();
+    }
+    return rc;
+}
+
+extern "C" int wrt_pi05_runtime_prepare_vision(
+    wrt_pi05_runtime* h,
+    const wrt_pi05_vision_frame* frames,
+    uint64_t n_frames) {
+    if (!h || !h->runtime || (!frames && n_frames)) return -1;
+    if (n_frames != h->vision_frames.size()) {
+        h->last_error = "Pi05 vision frame count does not match the runtime";
+        return -4;
+    }
+    std::fill(h->vision_seen.begin(), h->vision_seen.end(), 0);
+    for (uint64_t i = 0; i < n_frames; ++i) {
+        const wrt_pi05_vision_frame& in = frames[i];
+        if (in.struct_size < sizeof(wrt_pi05_vision_frame) ||
+            !in.name || !in.data) {
+            h->last_error = "invalid Pi05 vision frame";
+            return -1;
+        }
+        if (!valid_pixel_format(in.pixel_format)) {
+            h->last_error = "Pi05 vision pixel format is invalid";
+            return -4;
+        }
+        std::size_t slot = h->vision_frames.size();
+        for (std::size_t j = 0; j < h->vision_frames.size(); ++j) {
+            if (h->vision_frames[j].name == in.name) {
+                slot = j;
+                break;
+            }
+        }
+        if (slot == h->vision_frames.size() || h->vision_seen[slot]) {
+            h->last_error = "Pi05 vision frame name is unknown or duplicated";
+            return -4;
+        }
+        h->vision_seen[slot] = 1;
+        auto& out = h->vision_frames[slot];
+        out.image.data = const_cast<void*>(in.data);
+        out.image.bytes = in.bytes;
+        out.image.dtype = wllm::modalities::DType::kUInt8;
+        out.image.place = wllm::modalities::MemoryPlace::kHost;
+        out.image.layout = wllm::modalities::Layout::kHWC;
+        out.image.shape = wllm::modalities::Shape{
+            static_cast<uint64_t>(std::max(0, in.height)),
+            static_cast<uint64_t>(std::max(0, in.width)),
+            pixel_channels(in.pixel_format)};
+        out.format = pixel_format(in.pixel_format);
+        out.width = in.width;
+        out.height = in.height;
+        out.stride_bytes = in.stride_bytes;
+        out.timestamp_ns = in.timestamp_ns;
+    }
+    auto st = h->runtime->prepare_vision(h->vision_frames);
+    if (!st.ok_status()) {
+        h->last_error = st.message;
+        return status_code(st);
+    }
+    h->last_error.clear();
+    return 0;
+}
+
+extern "C" int wrt_pi05_runtime_replay_tick(wrt_pi05_runtime* h) {
+    if (!h || !h->runtime) return -1;
+    int rc = h->runtime->replay_tick();
+    if (rc != 0) h->last_error = "Pi05 graph replay failed";
+    return rc;
+}
+
+extern "C" int wrt_pi05_runtime_read_actions(wrt_pi05_runtime* h,
+                                             float* out_actions,
+                                             uint64_t out_capacity,
+                                             uint64_t* n_written) {
+    if (!h || !h->runtime || !out_actions) return -1;
+    auto st = h->runtime->read_actions(&h->action_values);
+    if (!st.ok_status()) {
+        h->last_error = st.message;
+        return status_code(st);
+    }
+    if (out_capacity < h->action_values.size()) {
+        h->last_error = "action output buffer is too small";
+        if (n_written) *n_written = h->action_values.size();
+        return -5;
+    }
+    std::memcpy(out_actions, h->action_values.data(),
+                h->action_values.size() * sizeof(float));
+    if (n_written) *n_written = h->action_values.size();
+    h->last_error.clear();
+    return 0;
+}
+
+extern "C" const wrt_runtime_export_v1* wrt_pi05_runtime_export(
+    wrt_pi05_runtime* h) {
+    if (!h || !h->runtime) return nullptr;
+    return h->runtime->export_runtime();
+}
+
+extern "C" const char* wrt_pi05_runtime_last_error(wrt_pi05_runtime* h) {
+    if (!h) return "null Pi05 runtime";
+    return h->last_error.c_str();
+}

@@ -1,0 +1,36 @@
+model_name: WorldPlayWanTransformer3DModel
+text_encoder_name: UMT5EncoderModel
+vae_name: AutoencoderKLWan
+device: cuda
+dtype: bfloat16
+kv_dtype: bfloat16
+seed: 42
+prompt: First-person view walking around a fantastic village.
+image_path: assets/fantasy_village.png
+tokenizer_path: checkpoints/wan/tokenizer
+text_encoder_path: checkpoints/wan/text_encoder
+transformer_path: checkpoints/worldplay-5b
+vae_path: checkpoints/wan/vae-2.2
+
+max_sequence_length: 512
+stabilization_level: 15
+max_num_frames: 285
+max_num_actions: 72
+height: 704
+width: 1280
+num_videos_per_prompt: 1
+num_inference_steps: 4
+first_chunk_size: 4
+chunk_size: 4
+context_window_size: 16
+continuous_decoding: false
+reactive_decoding: true
+guidance_scale: 1.0
+
+attention_backend: auto
+kv_memory: preallocated_prope
+use_cuda_graph: false
+
+video_buffer_name: worldplay_video
+ctrl_buffer_name: worldplay_ctrl
+action_buffer_name: worldplay_action

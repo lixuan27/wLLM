@@ -1,0 +1,78 @@
+model_name: LiveAvatarTransformer3DModel
+text_encoder_name: UMT5EncoderModel
+vae_name: AutoencoderKLWan
+device: cuda
+dtype: bfloat16
+kv_dtype: bfloat16
+seed: 42
+prompt: A pretty woman is introducing technology and fashion. Her hands are empty
+image_path: assets/fashion_blogger.jpg
+tokenizer_path: checkpoints/wan/tokenizer
+text_encoder_path: checkpoints/wan/text_encoder
+transformer_path: checkpoints/wan2.2-s2v-14b
+vae_path: checkpoints/wan/vae-2.1
+wav2vec2_path: checkpoints/wan2.2-s2v-14b/wav2vec2-large-xlsr-53-english
+lora_path: checkpoints/live-avatar/liveavatar.safetensors
+lora_rank: 128
+lora_alpha: 64.0
+lora_target_modules: "q,k,v,o,ffn.0,ffn.2"
+max_sequence_length: 512
+max_num_frames: 4096
+height: 704
+width: 384
+num_videos_per_prompt: 1
+num_inference_steps: 4
+first_chunk_size: 3
+chunk_size: 3
+context_window_size: 9
+continuous_decoding: true
+reactive_decoding: false
+stabilization_level: 15
+guidance_scale: 1.0
+attention_backend: auto
+kv_memory: preallocated
+motion_prefix_frames: 73
+motion_prefix_latent_frames: 19
+use_cuda_graph: false
+capture_shapes:
+  - [0, 1344, false]
+  - [0, 1344, true]
+  - [1344, 2688, false]
+  - [0, 2688, true]
+  - [2688, 4032, false]
+  - [0, 4032, true]
+  - [4032, 5376, false]
+  - [0, 5376, true]
+  - [5376, 6720, false]
+
+video_buffer_name: liveavatar_video
+ctrl_buffer_name: liveavatar_ctrl
+action_buffer_name: liveavatar_action
+audio_buffer_name: liveavatar_audio_input
+audio_output_buffer_name: liveavatar_audio_output
+signal_buffer_name: liveavatar_signal
+
+audio_frame_samples: 320
+audio_sample_rate: 16000
+audio_max_chunks: 8192
+audio_stretch_ratio: 1.0
+tts_chunk_size: 7680
+
+tts_model_name: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+tts_voice: "vivian"
+tts_language: "English"
+tts_prompt_token_count: 2048
+tts_stage_configs_path: null
+tts_gpu_index: 1
+
+
+llm_model_name: "Qwen/Qwen3-4B-Instruct-2507"
+llm_gpu_index: 1
+llm_gpu_memory_utilization: 0.3
+llm_max_model_len: 8192
+llm_max_completion_tokens: 80
+llm_temperature: 0.8
+llm_top_p: 0.95
+
+asr_model_name: "Qwen/Qwen3-ASR-1.7B"
+asr_gpu_index: null
