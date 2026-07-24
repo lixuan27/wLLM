@@ -31,7 +31,7 @@ wllm = ["control/registry_data/*.yaml"]
 testpaths = ["tests"]
 
 [tool.coverage.run]
-source = ["wllm/control"]
+source = ["wllm/control", "wllm/composite", "wllm/techniques", "wllm/omni"]
 
 [tool.coverage.report]
 show_missing = true

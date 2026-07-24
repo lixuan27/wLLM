@@ -107,6 +107,19 @@ invariants:
 `Discovered → Cataloged → Launchable → Parity-verified → Optimized-1GPU → Optimized-multiGPU → Serving-verified → Production`。
 每层晋升都要有落盘证据；BETA_REPORT 的 tier ledger 延续此制度。
 
+## 3.6 数据面四支柱（v2.1 新增，全部自研在库、不依赖外部引擎）
+
+对应四类上游能力的**自研优化实现**（不具名纪律不变；外部引擎绑定仍保留为可选互换项）：
+
+| 支柱 | 模块 | 核心语义 | authenticity 信号 |
+|---|---|---|---|
+| 组合式图运行时 | `wllm/composite/` | ComponentGraph + 请求=Walk（Seq/Par/Loop/Stream）；placement 是数据；session 状态硬隔离可证 reset；有界流背压；跨请求步级合批（签名分组，逐请求 parity） | 每次调用记录 device；`cross_signature_mixes()==0` |
+| omni 分阶段引擎 | `wllm/omni/` | AsyncOmni 契约自研实现：stage-config YAML（占位符自解析）、AR 连续合批调度器 + 整请求生成调度器、输出对象兼容 apps 消费形状；模型 stage 可插拔注册，未注册模型 **fail closed**（echo stub 仅显式请求） | `stats().max_step_batch>=2`；steps/completed 计数 |
+| 目录/资产控制面 | `wllm/backends/catalog/` | manifest 导入（root 自动发现）+ **内容级资产就绪检查**（缺文件/短文件=代理 stub/JSON 损坏→显式 blockers） | ReadinessReport.blockers 逐条留证 |
+| 优化技术执行器 | `wllm/techniques/` | 技术=声明 spec+authenticity 信号；step 残差缓存 / int8 量化模拟；编排器持 exact 参照对照候选：崩溃/未 engage/超质量预算/形状漂移一律拒绝并给理由，输出 receipt 兼容字段 | `steps_reused>0`、`layers_quantized>0`；缺信号=拒绝 |
+
+铁律：技术候选**不能给自己打分**——参照、对照与预算全部由编排器持有；`wllm.omni` 可经 `WLLM_OMNI_ENGINE=wllm.omni` 绑定为 apps 的默认引擎（契约固定，厂商可换）。
+
 ## 4. wGraph（IR，承自 v1）
 
 - Region：Sequential / Parallel / Autoregressive / Diffusion / Flow / ChunkRollout / HierarchicalRollout / MultiAgent / Feedback / Environment / Composition。循环语义一等公民。
@@ -158,9 +171,17 @@ reference=ckpt 声明精度；batching 改变结果但分布可不变。
 successive-halving；drift-gated verdicts；双引擎统一；Alpha 3 模型中位 2.75×；
 CFG branch-parallel 1.74× bit-exact（2 GPU）；全管线 1.44× bit-exact；Qwen3-VL 2.75×（tie-aware exact）；
 OpenVLA 4.59×（native bf16）；E2E app Launchable（704 帧）；Hopper probe tier；两环境 VLA bridge。
-**M16（本轮）**：命名纪律全树清零 + 控制面 v0（OptimizeSpec/inspect/registry/receipts/apply/rollback）+ BDD/mutation/coverage 门控。
-**M17+**：控制面接通真实 plan 重放（Wan2.2 CFG-parallel receipt 化）；MCP server 入口；
-qwen3_omni/liveavatar 权重落地 → Launchable 复制；24h soak + 故障注入（Beta 收口）。
+**M16**：命名纪律全树清零 + 控制面 v0（OptimizeSpec/inspect/registry/receipts/apply/rollback）+ BDD/mutation/coverage 门控。
+**M17（本轮）**：数据面四支柱自研在库（§3.6）：composite 图运行时 / omni 分阶段引擎（AsyncOmni 契约） /
+目录资产内容级就绪检查 / 优化技术执行器与 fail-closed 编排器；registry 增 wllm-composite/wllm-omni；
+BDD 增技术编排 3 场景；mutation 目标扩至 7 文件。**多 agent 分工**：独立对抗审查 agent 复核四支柱，
+确认并修复 3 P0（引擎捏造 latent 表→改为 stage 钩子且构造期 fail-closed；生成 payload 错键→契约键直落；
+中毒请求滞留共享 scheduler→abort+批失败退休+感染请求 raise 而非伪造 final；stream 通道跨 session→按 session 隔离并入 reset）
+及 F4-F13 批量加固（默认 scheduler 静默替换、stage 顺序/重复 id、Par join/原位变异、Loop 陈旧 until/嵌套 index、
+空参照 oracle、缓存连续重用上限+reset 清计数、恒零假证据可证伪化、资产 exact-size 校验）。
+风险登记册 `docs/RISK_REGISTER.md`（P0/P1×缓解×缺口×责任角色）。分层诚实：四支柱为 **CPU/contract-verified 基建层**，GPU 实测挂接为后续里程碑。
+**M18+**：wllm.omni 注册真实模型 runner（打通 qwen3_omni app 于自研引擎）；composite 承接 Wan2.2 CFG-parallel
+实测 plan 重放并 receipt 化；MCP server 入口；24h soak + 故障注入（Beta 收口）。
 **1.0（9–12 周）**：Feedback/MultiAgent region、WAM deadline scheduler、approximate（FP8/NVFP4/KV 量化）、
 可选 L3 native 后端、在线 plan 路由、双硬件家族。
 

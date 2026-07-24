@@ -28,8 +28,10 @@ python -m pytest tests/ -q || FAIL=1
 step "BDD feature scenarios"
 python tests/test_bdd_scenarios.py || FAIL=1
 
-step "coverage gate (control plane >= 85%)"
+step "coverage gate (control plane + data-plane pillars >= 85%)"
 python -m coverage run -m pytest -q tests/test_control_plane.py tests/test_bdd_scenarios.py \
+    tests/test_composite.py tests/test_techniques.py tests/test_omni_engine.py \
+    tests/test_catalog_assets.py \
   && python -m coverage report --fail-under=85 | tee .wllm_coverage.txt || FAIL=1
 
 step "mutation smoke (kill rate >= 80%)"

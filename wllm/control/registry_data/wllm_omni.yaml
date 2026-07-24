@@ -1,0 +1,21 @@
+# In-tree omni-modal staged engine (AsyncOmni-contract implementation).
+backend: wllm-omni
+version: "0.0.1a0"
+models:
+  compatible:
+    - "echo"       # deterministic dry-run stage; real runners register at runtime
+modalities:
+  input: [text, image, audio, latent]
+  output: [text, audio, latent]
+passes:
+  continuous_batching:
+    quality: exact
+    notes: max_step_batch >= 2 in engine stats is the authenticity signal
+  staged_pipeline:
+    quality: exact
+  generation_stage_batching:
+    quality: exact
+invariants:
+  forbidden_log_patterns:
+    - "no registered stage backend"
+    - "scheduler bypassed"

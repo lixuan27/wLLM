@@ -40,6 +40,9 @@ only works when a model is improvising, it is a prompt, not infra.
 | Component | Role |
 |---|---|
 | **Control plane** | Typed OptimizeSpec, project inspector (absence recorded, never guessed), declarative backend-capability registry (requires/conflicts/fail-closed log invariants), measured receipts with deployment fingerprints, apply/rollback state machine |
+| **Composite runtime** | Component graphs with requests as walks (sequential / parallel / loop / streaming); placement is data, session state is hard-isolated with provable reset, streams carry bounded queues + backpressure, and cross-request step batching preserves per-request parity by construction |
+| **Omni stage engine** | In-tree async multi-stage engine implementing the `AsyncOmni` contract the apps program against: stage-config YAMLs, continuous-batching AR scheduler + whole-request generation scheduler, pluggable model stages that fail closed on unregistered models (`stats().max_step_batch` is the batching authenticity signal) |
+| **Technique executors** | Optimization techniques (step-residual cache, quantization simulation, …) that carry declared authenticity signals; an orchestrator runs every candidate against the frozen exact reference and rejects crashed / never-engaged / over-budget candidates with reasons — a technique can never grade itself |
 | **wGraph** | Typed, stateful, hierarchical IR: execution regions (AR / diffusion / chunk-rollout / multi-agent / feedback), semantic state contracts (KV / recurrent / rolling-context / feedback-critical, with `verified` probe gating), rate-and-deadline-aware streams, exact-vs-bounded quality contracts |
 | **Tessera Planner** | Budget-controlled deployment search: rule-based candidates from region semantics → constraint filtering (memory / state placement / deadlines, with rejection reasons) → analytic cost model (critical-path latency, bottleneck-resource period) → successive-halving measurement |
 | **wRuntime** | Reference executor (always-correct fallback anchor), staged pipelines, cold/warm/hot lifecycle contract, deployment fingerprinting, plan fallback chain |
@@ -91,8 +94,11 @@ sbatch slurm/wllm_ci_cpu.sbatch   # or run the steps directly on any CPU box
 The CI battery: naming/secret release gate → full syntax sweep → unit +
 integration tests (pytest) → gherkin BDD scenarios driving the real CLI
 (`tests/features/*.feature`, zero-dependency runner) → coverage gate
-(control plane ≥ 85%) → mutation smoke (AST mutants of the fail-closed
-core; kill rate ≥ 80% required).
+(control plane + data-plane pillars ≥ 85%) → mutation smoke (AST mutants
+of the fail-closed core; kill rate ≥ 80% required). Independent
+adversarial review is part of the process — findings land as pinned
+regression tests, and `docs/RISK_REGISTER.md` maps every P0/P1 risk to
+its concrete mitigation and its honest residual gap.
 
 ## Quick start (developer preview)
 

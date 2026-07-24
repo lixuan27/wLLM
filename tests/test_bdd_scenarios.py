@@ -161,6 +161,92 @@ def then_diagnose_only(ctx):
     assert mgr.state().active == "reference"
 
 
+# ------------------------------------------------- technique orchestration
+
+from wllm.techniques import (  # noqa: E402
+    QualityBudget, StepResidualCache, TechniqueOrchestrator, TechniqueSpec,
+)
+from wllm.techniques.step_cache import run_loop  # noqa: E402
+
+_X0 = [1.0, -2.0, 3.0, 0.5]
+
+
+def _smooth(x, k):
+    return [v * 0.99 + 0.01 for v in x]
+
+
+def _jumpy(x, k):
+    return [v * (2.0 if k % 2 == 0 else 0.4) + 1.0 for v in x]
+
+
+def _cache_candidate(step_fn, threshold):
+    def run():
+        c = StepResidualCache(step_fn, threshold=threshold)
+        out = run_loop(c, _X0, 20)
+        return out, c.authenticity()
+    return run
+
+
+def _tech_spec():
+    return TechniqueSpec(name="step_cache", family="cache",
+                         authenticity_signals=["steps_reused"])
+
+
+@steps.given(r"a smooth iterative workload and a step cache candidate")
+def given_smooth_cache(ctx):
+    ctx["orch"] = TechniqueOrchestrator(
+        lambda: run_loop(_smooth, _X0, 20),
+        QualityBudget(max_rel_deviation=0.05))
+    ctx["candidates"] = [(_tech_spec(), _cache_candidate(_smooth, 0.05))]
+
+
+@steps.given(r"a jumpy iterative workload and a step cache candidate")
+def given_jumpy_cache(ctx):
+    ctx["orch"] = TechniqueOrchestrator(
+        lambda: run_loop(_jumpy, _X0, 20),
+        QualityBudget(max_rel_deviation=0.5))
+    ctx["candidates"] = [(_tech_spec(), _cache_candidate(_jumpy, 0.05))]
+
+
+@steps.given(r"a smooth iterative workload and an over-aggressive cache "
+             r"candidate under a strict budget")
+def given_aggressive_cache(ctx):
+    ctx["orch"] = TechniqueOrchestrator(
+        lambda: run_loop(_smooth, _X0, 20),
+        QualityBudget(max_rel_deviation=1e-6))
+    ctx["candidates"] = [(_tech_spec(), _cache_candidate(_smooth, 0.9))]
+
+
+@steps.when(r"the technique orchestrator evaluates the candidates")
+def when_orchestrate(ctx):
+    ctx["verdicts"] = ctx["orch"].evaluate(ctx["candidates"])
+
+
+@steps.then(r"the cache candidate is accepted with nonzero reuse evidence")
+def then_cache_accepted(ctx):
+    v = ctx["verdicts"][0]
+    assert v.accepted, v.reason
+    assert v.authenticity.get("steps_reused", 0) > 0
+
+
+@steps.then(r"its receipt reports a bounded quality verdict")
+def then_receipt_bounded(ctx):
+    rec = ctx["verdicts"][0].receipt_fields()
+    assert rec["quality"]["verdict"] == "bounded", rec
+
+
+@steps.then(r"the cache candidate is rejected because it never engaged")
+def then_cache_never_engaged(ctx):
+    v = ctx["verdicts"][0]
+    assert not v.accepted and "never engaged" in v.reason, v.reason
+
+
+@steps.then(r"the cache candidate is rejected for exceeding the budget")
+def then_cache_over_budget(ctx):
+    v = ctx["verdicts"][0]
+    assert not v.accepted and "quality budget exceeded" in v.reason, v.reason
+
+
 # ------------------------------------------------------------------ driver
 
 FEATURES = sorted((Path(__file__).parent / "features").glob("*.feature"))

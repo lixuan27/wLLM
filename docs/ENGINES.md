@@ -22,6 +22,13 @@ engine-internal classes through the `__WLLM_OMNI_ENGINE__` placeholder;
 `render_stage_config()` substitutes the bound package name right before
 the config path is handed to the engine.
 
+**In-tree default**: `WLLM_OMNI_ENGINE=wllm.omni` binds the repository's
+own staged engine (`wllm/omni/`), which implements the same contract —
+`AsyncOmni`, the stage-config schema (it also resolves the placeholder
+natively), AR/generation stage schedulers, and app-compatible output
+objects. Real model runners register via `wllm.omni.stages.register_stage`;
+unregistered models fail closed rather than silently degrading.
+
 If a stage needs the engine and the variable is unset, the app fails
 closed at import with `OmniEngineNotBound` — it never silently falls
 back to a slower path.

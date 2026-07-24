@@ -27,15 +27,27 @@ TARGETS = (
     "wllm/control/registry.py",
     "wllm/control/state.py",
     "wllm/control/spec.py",
+    "wllm/techniques/step_cache.py",
+    "wllm/techniques/orchestrator.py",
+    "wllm/composite/batching.py",
 )
 SANDBOX_FILES = (
     "wllm/__init__.py",
     "tests/test_control_plane.py",
+    "tests/test_composite.py",
+    "tests/test_techniques.py",
 )
 SANDBOX_TREES = (
     "wllm/control",
+    "wllm/graph",
+    "wllm/composite",
+    "wllm/techniques",
 )
-TEST_CMD = [sys.executable, "tests/test_control_plane.py"]
+TEST_CMDS = (
+    [sys.executable, "tests/test_control_plane.py"],
+    [sys.executable, "tests/test_composite.py"],
+    [sys.executable, "tests/test_techniques.py"],
+)
 
 _CMP_SWAP = {ast.Eq: ast.NotEq, ast.NotEq: ast.Eq, ast.Lt: ast.GtE,
              ast.GtE: ast.Lt, ast.Gt: ast.LtE, ast.LtE: ast.Gt}
@@ -151,13 +163,16 @@ def build_sandbox(dst: Path) -> None:
 
 
 def run_suite(sandbox: Path, timeout_s: float = 120.0) -> bool:
-    """True == suite green (mutant survived)."""
-    try:
-        out = subprocess.run(TEST_CMD, cwd=sandbox, capture_output=True,
-                             text=True, timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        return False                       # hang counts as killed
-    return out.returncode == 0 and "ALL PASS" in out.stdout
+    """True == every focused suite green (mutant survived)."""
+    for cmd in TEST_CMDS:
+        try:
+            out = subprocess.run(cmd, cwd=sandbox, capture_output=True,
+                                 text=True, timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            return False                   # hang counts as killed
+        if out.returncode != 0 or "ALL PASS" not in out.stdout:
+            return False
+    return True
 
 
 def main() -> int:

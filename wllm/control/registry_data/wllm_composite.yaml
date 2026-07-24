@@ -1,0 +1,26 @@
+# In-tree composite graph runtime (component graphs + request walks).
+backend: wllm-composite
+version: "0.0.1a0"
+models:
+  compatible:
+    - "graph:*"    # models expressed as declared component graphs
+modalities:
+  input: [text, image, video, audio, action, latent]
+  output: [text, image, video, audio, action, latent]
+passes:
+  component_placement:
+    quality: exact
+    notes: placement is data; every invocation records its device
+  cross_request_step_batching:
+    quality: exact
+    requires: {components_batchable: true}
+    notes: per-request parity enforced by signature grouping + tests
+  session_state_isolation:
+    quality: exact
+  stream_backpressure:
+    quality: exact
+    notes: bounded queues mandatory; overflow policy from the stream spec
+invariants:
+  forbidden_log_patterns:
+    - "walk fell back to sequential execution"
+    - "state shared across sessions"

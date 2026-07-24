@@ -28,3 +28,5 @@ native/third_party/
 .wllm/
 .wllm.env
 native/wllm_native/
+.coverage
+.wllm_coverage.txt
