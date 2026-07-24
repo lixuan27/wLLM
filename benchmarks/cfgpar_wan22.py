@@ -96,12 +96,43 @@ def main() -> int:
             lat = sch.step(pred, t, lat, return_dict=False)[0]
         return lat
 
-    lat = denoise()  # warmup
+    e2e = os.environ.get("WLLM_CFGPAR_E2E", "0") == "1"
+
+    if e2e and hasattr(pipe.vae, "enable_tiling"):
+        # full-clip conv3d decode peaks over HBM with the transformer
+        # resident (OOM in job 196279); tiling bounds the activation peak.
+        # Applied identically in every mode — the comparison stays fair.
+        pipe.vae.enable_tiling()
+
+    @torch.inference_mode()   # job 196279/196282 OOM root cause: decode ran
+    def decode(lat: torch.Tensor) -> torch.Tensor:   # with autograd tracking
+        """Denormalize + VAE decode, as the pipeline's own call path does."""
+        vae = pipe.vae
+        mean = (torch.tensor(vae.config.latents_mean)
+                .view(1, vae.config.z_dim, 1, 1, 1).to(device))
+        inv_std = (1.0 / torch.tensor(vae.config.latents_std)
+                   .view(1, vae.config.z_dim, 1, 1, 1)).to(device)
+        z = lat.to(torch.bfloat16) / inv_std.to(torch.bfloat16) \
+            + mean.to(torch.bfloat16)
+        video = vae.decode(z, return_dict=False)[0]
+        return ((video.float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8)
+
+    def run_once():
+        lat = denoise()
+        frames = None
+        if e2e and rank == 0:
+            frames = decode(lat)
+        if world > 1:
+            import torch.distributed as dist
+            dist.barrier()   # rank1 waits so E2E wall time is symmetric
+        return lat, frames
+
+    lat, frames = run_once()  # warmup
     torch.cuda.synchronize()
     times = []
     for _ in range(2):
         t0 = time.monotonic()
-        lat = denoise()
+        lat, frames = run_once()
         torch.cuda.synchronize()
         times.append((time.monotonic() - t0) * 1000.0)
     med = sorted(times)[len(times) // 2]
@@ -110,6 +141,8 @@ def main() -> int:
         out = ROOT / "benchmarks/results"
         out.mkdir(parents=True, exist_ok=True)
         torch.save(lat.cpu(), out / f"wan22_cfgpar_latent_{MODE}.pt")
+        if frames is not None:
+            torch.save(frames.cpu(), out / f"wan22_cfgpar_frames_{MODE}.pt")
         rec = {"mode": MODE, "world": world, "median_ms": med,
                "times_ms": times, "steps": STEPS, "frames": FRAMES,
                "h": H, "w": W, "seed": SEED, "cfg": CFG}
