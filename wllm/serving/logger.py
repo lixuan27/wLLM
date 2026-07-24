@@ -33,7 +33,7 @@ _DATE_FORMAT = "%m-%d %H:%M:%S"
 DEFAULT_LOGGING_CONFIG = {
     "formatters": {
         "wllm": {
-            "class": "wllm.logging_utils.NewLineFormatter",
+            "class": "wllm.serving.logging_utils.NewLineFormatter",
             "datefmt": _DATE_FORMAT,
             "format": _FORMAT,
         },
@@ -206,8 +206,8 @@ def _configure_wllm_root_logger() -> None:
 
     for formatter in logging_config.get("formatters", {}).values():
         # This provides backwards compatibility after #10134.
-        if formatter.get("class") == "wllm.logging.NewLineFormatter":
-            formatter["class"] = "wllm.logging_utils.NewLineFormatter"
+        if formatter.get("class") == "wllm.serving.logging.NewLineFormatter":
+            formatter["class"] = "wllm.serving.logging_utils.NewLineFormatter"
 
     if logging_config:
         dictConfig(logging_config)

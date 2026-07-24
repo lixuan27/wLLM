@@ -134,7 +134,7 @@ for model_arch, spec in _LEGACY_WLLM_MODELS.items():
         continue
     _WLLM_MODELS[model_arch] = spec
 
-_SUBPROCESS_COMMAND = [sys.executable, "-m", "wllm.models.dit.registry"]
+_SUBPROCESS_COMMAND = [sys.executable, "-m", "wllm.serving.models.dit.registry"]
 
 _T = TypeVar("_T")
 
@@ -365,8 +365,8 @@ class _ModelRegistry:
 ModelRegistry = _ModelRegistry({
     model_arch:
     _LazyRegisteredModel(
-        module_name=(f"wllm.models.{component_name}.{mod_relname}"
-                     if mod_relname else f"wllm.models.{component_name}"),
+        module_name=(f"wllm.serving.models.{component_name}.{mod_relname}"
+                     if mod_relname else f"wllm.serving.models.{component_name}"),
         component_name=component_name,
         class_name=cls_name,
     )

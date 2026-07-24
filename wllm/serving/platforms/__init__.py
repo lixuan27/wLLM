@@ -41,7 +41,7 @@ def cuda_platform_plugin() -> str | None:
     if is_cuda:
         logger.info("CUDA is available")
 
-    return "wllm.platforms.cuda.CudaPlatform" if is_cuda else None
+    return "wllm.serving.platforms.cuda.CudaPlatform" if is_cuda else None
 
 
 
@@ -53,7 +53,7 @@ def rocm_platform_plugin() -> str | None:
     # the cuda plugin would also match -- resolve ROCm first.
     if getattr(torch.version, "hip", None) is not None:
         logger.info("ROCm platform detected (HIP %s)", torch.version.hip)
-        return "wllm.platforms.rocm.RocmPlatform"
+        return "wllm.serving.platforms.rocm.RocmPlatform"
     return None
 
 
