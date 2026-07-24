@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wllm"
+version = "0.0.1a0"
+description = "wLLM: World and Multimodal Model Serving — verified automatic deployment synthesis for AR, diffusion, video, world, and world-action models"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "wLLM contributors" }]
+dependencies = ["pyyaml>=6.0"]
+
+[project.optional-dependencies]
+torch = ["torch>=2.6", "safetensors"]
+worldfoundry = []          # catalog import is stdlib+pyyaml; runners resolve lazily
+video = ["diffusers>=0.35", "transformers", "imageio", "imageio-ffmpeg"]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["wllm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
