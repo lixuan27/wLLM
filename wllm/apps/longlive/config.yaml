@@ -50,4 +50,5 @@ audio_frame_samples: 320
 audio_sample_rate: 16000
 audio_max_chunks: 8192
 
-asr_model_name: "Qwen/Qwen3-ASR-1.7B"
+# resolved from local checkpoints (ModelScope mirror) — no hub fetch at launch
+asr_model_name: "checkpoints/Qwen3-ASR-1.7B"

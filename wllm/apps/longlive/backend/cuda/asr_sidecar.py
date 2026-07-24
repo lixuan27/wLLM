@@ -36,7 +36,7 @@ def main():
     from qwen_asr import Qwen3ASRModel
     asr = Qwen3ASRModel.from_pretrained(
         cfg.asr_model_name, dtype=torch.bfloat16, device_map=dev,
-        attn_implementation="flash_attention_2", max_inference_batch_size=1,
+        attn_implementation="sdpa", max_inference_batch_size=1,
         max_new_tokens=256)
     if os.getenv("WLLM_SKIP_ASR_WARMUP", "0") != "1":
         try:

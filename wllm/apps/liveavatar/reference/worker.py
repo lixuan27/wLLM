@@ -265,7 +265,7 @@ class LiveAvatarWorker:
                 if self.cfg.asr_gpu_index is not None
                 else "cuda:0"
             ),
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
             max_inference_batch_size=1,
             max_new_tokens=256,
         )

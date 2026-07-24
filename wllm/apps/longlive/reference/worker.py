@@ -177,7 +177,7 @@ class LongLiveWorker:
             self.cfg.asr_model_name,
             dtype=torch.bfloat16,
             device_map=str(self.device),
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",  # portable: fused SDPA on any arch, no extra wheel
             max_inference_batch_size=1,
             max_new_tokens=256,
         )

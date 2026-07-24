@@ -73,7 +73,13 @@ class RMSNorm(CustomOp):
             weight = self.weight if self.has_weight else None
             return F.rms_norm(x, (x.shape[-1], ), weight, self.eps)
 
-        import flashinfer
+        try:
+            import flashinfer
+        except ImportError:
+            # portable path: torch's fused rms_norm (works on any arch,
+            # no extra wheel); numerically the same reduction
+            weight = self.weight if self.has_weight else None
+            return F.rms_norm(x, (x.shape[-1], ), weight, self.eps)
         b, s, d = x.shape
         x = x.reshape(b * s, d)
         x = flashinfer.norm.rmsnorm(x, self.weight, self.eps).reshape(b, s, d)

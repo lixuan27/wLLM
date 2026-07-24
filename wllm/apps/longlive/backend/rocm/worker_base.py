@@ -95,7 +95,7 @@ class LongLiveWorkerBase:
             self.cfg.asr_model_name,
             dtype=torch.bfloat16,
             device_map=asr_device,
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
             max_inference_batch_size=1,
             max_new_tokens=256,
         )

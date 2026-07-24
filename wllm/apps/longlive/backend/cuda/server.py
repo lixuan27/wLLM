@@ -180,7 +180,7 @@ class LongLiveServer:
             from qwen_asr import Qwen3ASRModel
             self._asr = Qwen3ASRModel.from_pretrained(
                 self.cfg.asr_model_name, dtype=torch.bfloat16, device_map=self.asr_device,
-                attn_implementation="flash_attention_2", max_inference_batch_size=1,
+                attn_implementation="sdpa", max_inference_batch_size=1,
                 max_new_tokens=256)
             if os.getenv("WLLM_SKIP_ASR_WARMUP", "0") != "1":
                 try:

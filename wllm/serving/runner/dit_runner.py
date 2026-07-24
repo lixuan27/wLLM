@@ -66,9 +66,23 @@ class DiTRunner:
         backend = self.cfg.attention_backend
         if backend == "auto":
             from wllm.serving.platforms import current_platform
-            backend = "aiter" if current_platform.is_rocm() else "fa4"
+            if current_platform.is_rocm():
+                backend = "aiter"
+            else:
+                # prefer the fastest wheel if present, else the portable
+                # SDPA path (torch's fused kernels; runs on any arch)
+                try:
+                    from flash_attn.cute.interface import flash_attn_func  # noqa: F401
+                    backend = "fa4"
+                except Exception:  # noqa: BLE001
+                    backend = "sdpa"
 
-        if backend == "fa4":
+        if backend == "sdpa":
+
+            from wllm.serving.layers.attention_backends.sdpa_backend import SDPABackend
+            self.attention_backend = SDPABackend()
+
+        elif backend == "fa4":
 
             from wllm.serving.layers.attention_backends.flashattention_4_backend import FA4Backend
             self.attention_backend = FA4Backend()
