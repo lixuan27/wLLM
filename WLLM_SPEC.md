@@ -180,8 +180,18 @@ BDD 增技术编排 3 场景；mutation 目标扩至 7 文件。**多 agent 分�
 及 F4-F13 批量加固（默认 scheduler 静默替换、stage 顺序/重复 id、Par join/原位变异、Loop 陈旧 until/嵌套 index、
 空参照 oracle、缓存连续重用上限+reset 清计数、恒零假证据可证伪化、资产 exact-size 校验）。
 风险登记册 `docs/RISK_REGISTER.md`（P0/P1×缓解×缺口×责任角色）。分层诚实：四支柱为 **CPU/contract-verified 基建层**，GPU 实测挂接为后续里程碑。
-**M18+**：wllm.omni 注册真实模型 runner（打通 qwen3_omni app 于自研引擎）；composite 承接 Wan2.2 CFG-parallel
-实测 plan 重放并 receipt 化；MCP server 入口；24h soak + 故障注入（Beta 收口）。
+**M18（本轮，多 agent 分工：2 实现 agent + 主线并行）**：
+① **真实证据 receipt 化**（`wllm/control/evidence.py` + `scripts/receipt_wan22_cfgpar.py`）：job 196293 日志
+（ref 5761.6ms → 2GPU 并行 4002.4ms = 1.44×，帧级 bit-exact）解析为可晋升 receipt 并在 CI dogfood；
+同一 job 的批内 CFG 变体（max_abs 251/255）被同一门正确拒绝——控制面首次接通真实测量数据。
+② **MCP 入口**（`wllm/control/mcp.py`，`wllm-mcp`）：stdio JSON-RPC 暴露 inspect/plan/verify/apply/rollback/report
+六工具；server 只加传输不加判断，diagnose-only(rc 3) 是真话不是错误。
+③ **技术组合器**（`wllm/techniques/composer.py`，agent 实现）：verified singles 的组合搜索——组合合法性靠测量
+不靠假设；超可加漂移/变慢/预算违约=interference 且带理由；工厂纯度机制杜绝跨 repeats 状态泄漏。
+④ **计划下沉**（`wllm/composite/lowering.py`，agent 实现）：DeploymentPlan → 组件 placement，fail-closed
+（未知 node/未分配/双分配/pin 违约/cpu 域错置/parallel_degree>1 诚实拒绝/硬件越界），require() 单一执行闸。
+**M19+**：wllm.omni 注册真实模型 runner（qwen3_omni app 于自研引擎端到端）；composite 承接实测 plan 重放；
+Claude Code plugin 打包（MCP 已就绪）；24h soak + 故障注入（Beta 收口）。
 **1.0（9–12 周）**：Feedback/MultiAgent region、WAM deadline scheduler、approximate（FP8/NVFP4/KV 量化）、
 可选 L3 native 后端、在线 plan 路由、双硬件家族。
 

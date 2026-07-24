@@ -12,9 +12,11 @@ is rejected with a reason, never quietly kept.
     step_cache.py    residual step cache for iterative loops
     quant_sim.py     int8 weight-quantization simulation for linears
     orchestrator.py  reference-vs-candidate evaluation, fail-closed
+    composer.py      measured composition search over verified singles
 """
 
 from .base import QualityBudget, TechniqueResult, TechniqueSpec
+from .composer import Composable, ComposerReport, TechniqueComposer
 from .orchestrator import CandidateVerdict, TechniqueOrchestrator
 from .quant_sim import QuantizedLinears
 from .step_cache import StepResidualCache
@@ -23,4 +25,5 @@ __all__ = [
     "TechniqueSpec", "TechniqueResult", "QualityBudget",
     "StepResidualCache", "QuantizedLinears",
     "TechniqueOrchestrator", "CandidateVerdict",
+    "Composable", "ComposerReport", "TechniqueComposer",
 ]

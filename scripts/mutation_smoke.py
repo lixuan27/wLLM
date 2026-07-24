@@ -41,6 +41,7 @@ SANDBOX_TREES = (
     "wllm/control",
     "wllm/graph",
     "wllm/composite",
+    "wllm/planner",      # composite.lowering imports planner.plan
     "wllm/techniques",
 )
 TEST_CMDS = (

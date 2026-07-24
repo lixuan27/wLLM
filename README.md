@@ -35,6 +35,20 @@ wllm report   .
 The same commands run identically in CI with no agent present — if it
 only works when a model is improvising, it is a prompt, not infra.
 
+Agents connect over MCP (stdio): point a client at the bundled server
+and the six tools above appear with typed schemas — the server adds
+transport, never judgment.
+
+```json
+{"mcpServers": {"wllm": {"command": "wllm-mcp"}}}
+```
+
+The receipt pipeline is dogfooded on real evidence: the measured
+Wan2.2 CFG branch-parallel run (1.44× end-to-end, frame-level
+bit-exact, 2×H200) imports into a promotable receipt, while the
+batched-CFG variant from the same job (max deviation 251/255) is
+refused by the same gate — see `scripts/receipt_wan22_cfgpar.py`.
+
 ## Components
 
 | Component | Role |

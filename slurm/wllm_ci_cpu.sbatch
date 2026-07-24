@@ -31,8 +31,12 @@ python tests/test_bdd_scenarios.py || FAIL=1
 step "coverage gate (control plane + data-plane pillars >= 85%)"
 python -m coverage run -m pytest -q tests/test_control_plane.py tests/test_bdd_scenarios.py \
     tests/test_composite.py tests/test_techniques.py tests/test_omni_engine.py \
-    tests/test_catalog_assets.py \
+    tests/test_catalog_assets.py tests/test_evidence.py tests/test_mcp_server.py \
+    tests/test_technique_composer.py tests/test_composite_lowering.py \
   && python -m coverage report --fail-under=85 | tee .wllm_coverage.txt || FAIL=1
+
+step "real-evidence receipt (wan22 CFG branch-parallel, job 196293)"
+python scripts/receipt_wan22_cfgpar.py || FAIL=1
 
 step "mutation smoke (kill rate >= 80%)"
 python scripts/mutation_smoke.py --threshold 0.8 || FAIL=1

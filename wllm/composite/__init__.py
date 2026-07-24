@@ -11,15 +11,18 @@ action walks without duplicating the model.
     walk.py      walk algebra: Seq / Par / Loop / Stream
     executor.py  walk execution with session-state isolation + placement
     batching.py  cross-request step batching with per-request parity
+    lowering.py  DeploymentPlan -> component placement, fail-closed
 """
 
 from .graph import Component, ComponentGraph, Edge
 from .walk import Loop, Par, Seq, Stream, Walk
 from .executor import SessionStore, WalkExecutor
 from .batching import StepBatcher
+from .lowering import LoweringReport, lower_plan, require
 
 __all__ = [
     "Component", "ComponentGraph", "Edge",
     "Seq", "Par", "Loop", "Stream", "Walk",
     "SessionStore", "WalkExecutor", "StepBatcher",
+    "LoweringReport", "lower_plan", "require",
 ]
