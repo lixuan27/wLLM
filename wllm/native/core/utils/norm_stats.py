@@ -344,9 +344,16 @@ def pi05_candidates(checkpoint_dir: pathlib.Path) -> list[pathlib.Path]:
     checkpoints. The latter stores stats under ``assets/droid`` instead
     of ``assets/physical-intelligence/libero``.
     """
+    import os
     home = pathlib.Path.home()
-    return [
+    env_override = os.environ.get("WLLM_NORM_STATS")
+    prefix = [pathlib.Path(env_override)] if env_override else []
+    return prefix + [
         checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
+        # lerobot-format checkpoints keep dataset stats beside, not inside,
+        # the checkpoint; also probe the sibling dataset-stats convention
+        checkpoint_dir / "meta_stats.json",
+        checkpoint_dir.parent / "libero_dataset_stats" / "meta_stats.json",
         checkpoint_dir / "assets" / "droid" / "norm_stats.json",
         checkpoint_dir.parent / "pi05_libero" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
         checkpoint_dir.parent / "pi05_droid" / "assets" / "droid" / "norm_stats.json",
