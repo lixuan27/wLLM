@@ -86,9 +86,11 @@ message(STATUS "Using gencode flag: ${GPU_GENCODE}")
 # cuBLAS decomposed), hand-tuned for unified LPDDR memory — building
 # FA2 there would add ~10 MB to the .so and unused compile time.
 if(GPU_ARCH STREQUAL "80"  OR GPU_ARCH STREQUAL "86" OR
-   GPU_ARCH STREQUAL "87"  OR
+   GPU_ARCH STREQUAL "87"  OR GPU_ARCH STREQUAL "90" OR
    GPU_ARCH STREQUAL "89"  OR GPU_ARCH STREQUAL "120" OR
    GPU_ARCH STREQUAL "121")
+  # sm_90 (H100/H200): the SM80-family FA2 instantiations are forward-
+  # compatible; compiled as compute_90a SASS via the gencode block above.
   set(ENABLE_FA2 ON)
   message(STATUS "FA2 in-SO attention: ENABLED (sm_${GPU_ARCH})")
 else()

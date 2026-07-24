@@ -25,3 +25,4 @@ __pycache__/
 .pytest_cache/
 wf.tar.gz
 *.tar.gz
+native/third_party/

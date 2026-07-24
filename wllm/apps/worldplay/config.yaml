@@ -5,8 +5,8 @@ device: cuda
 dtype: bfloat16
 kv_dtype: bfloat16
 seed: 42
-prompt: First-person view walking around a fantastic village.
-image_path: assets/fantasy_village.png
+prompt: First-person view driving along a coastal road at sunset, waves crashing on the rocks.
+image_path: assets/coastal_road.png
 tokenizer_path: checkpoints/wan/tokenizer
 text_encoder_path: checkpoints/wan/text_encoder
 transformer_path: checkpoints/worldplay-5b
