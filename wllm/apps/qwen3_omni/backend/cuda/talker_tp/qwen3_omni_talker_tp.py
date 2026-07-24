@@ -1,6 +1,6 @@
 """[VENDORED] from wllm/models/qwen3_omni_talker.py (read-only shared
 runtime). Divergence: the detached Talker is made tensor-parallel-aware --
-_ensure_vllm_runtime / _build_vllm_config / VllmOmniTalker.__init__ /
+_ensure_vllm_runtime / _build_vllm_config / OmniTalker.__init__ /
 load_vllm_talker_model take (tp_size, rank, world_size, init_method) so the
 vLLM Talker module shards across `tp_size` GPUs when driven by `world_size`
 SPMD ranks sharing a tcp:// rendezvous. Used only by the talker_tp2 variant
@@ -12,11 +12,11 @@ Original module docstring follows.
 
 Qwen3-Omni Talker adapter + prompt-embedding helpers.
 
-The production path is ``VllmOmniTalker``: a detached single-request
-wrapper around vLLM-Omni's Talker module. wLLM still owns the
+The production path is ``OmniTalker``: a detached single-request
+wrapper around the engine's Talker module. wLLM still owns the
 Thinker/Talker/Vocoder scheduling and streaming decisions, while the
 Talker forward pass, paged attention, fused MoE, weight loading, and
-CodePredictor come from vLLM-Omni.
+CodePredictor come from the omni engine.
 
 The helper functions below build the Talker prefill ``inputs_embeds`` and
 trailing decode queue from Thinker outputs. They mirror upstream
@@ -56,8 +56,11 @@ from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.worker.workspace import init_workspace_manager
-from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_talker import (
-    Qwen3OmniMoeTalkerForConditionalGeneration as VllmQwen3OmniMoeTalker,
+from wllm.engines import omni as omni_engine
+
+EngineQwen3OmniMoeTalker = omni_engine.attr(
+    "model_executor.models.qwen3_omni.qwen3_omni_moe_talker",
+    "Qwen3OmniMoeTalkerForConditionalGeneration",
 )
 
 
@@ -112,15 +115,15 @@ def _ensure_vllm_runtime(
         )
 
 
-class VllmOmniTalker(nn.Module):
-    """Detached vLLM-Omni Talker with manual single-request scheduling.
+class OmniTalker(nn.Module):
+    """Detached engine Talker with manual single-request scheduling.
 
     This keeps wLLM's custom Thinker/Talker/Vocoder scheduler while
-    reusing vLLM-Omni's actual Talker module, paged-attention kernels, fused
+    reusing the engine's actual Talker module, paged-attention kernels, fused
     MoE kernels, weight loader, and CodePredictor implementation.
     """
 
-    uses_vllm_omni = True
+    uses_omni_engine = True
 
     def __init__(
         self,
@@ -165,7 +168,7 @@ class VllmOmniTalker(nn.Module):
                              rank=rank, world_size=world_size, init_method=init_method)
 
         logger.info(
-            "Building vLLM-Omni Talker module on %s (max_seq_len=%d)",
+            "Building engine Talker module on %s (max_seq_len=%d)",
             device,
             self.max_seq_len,
         )
@@ -173,7 +176,7 @@ class VllmOmniTalker(nn.Module):
         torch.set_default_dtype(dtype)
         try:
             with set_current_vllm_config(self.vllm_config):
-                self.model = VllmQwen3OmniMoeTalker(
+                self.model = EngineQwen3OmniMoeTalker(
                     vllm_config=self.vllm_config,
                     prefix="",
                 ).to(device=device, dtype=dtype)
@@ -186,7 +189,7 @@ class VllmOmniTalker(nn.Module):
             if isinstance(layer, Attention)
         }
         if not self._attention_layers:
-            raise RuntimeError("vLLM-Omni Talker did not register attention layers")
+            raise RuntimeError("engine Talker did not register attention layers")
 
         self._num_blocks = math.ceil(self.max_seq_len / self.block_size)
         self._metadata_builder = None
@@ -438,7 +441,7 @@ class VllmOmniTalker(nn.Module):
                 mapper=self.model.hf_to_vllm_mapper,
             )
             logger.info(
-                "vLLM-Omni Talker loaded %d parameter tensors",
+                "engine Talker loaded %d parameter tensors",
                 len(loaded),
             )
             process_weights_after_loading(
@@ -610,7 +613,7 @@ class VllmOmniTalker(nn.Module):
         last_talker_hidden: torch.Tensor,
         text_step: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run vLLM-Omni's graph-wrapped Talker MTP helper for one decode step."""
+        """Run the engine's graph-wrapped Talker MTP helper for one decode step."""
         with torch.cuda.device(self.device):
             self._mtp_input_ids.copy_(
                 input_ids.reshape(1, 1).to(device=self.device, dtype=torch.long)
@@ -702,8 +705,8 @@ def load_vllm_talker_model(
     world_size: int = 1,
     init_method: str | None = None,
     enforce_eager: bool = False,
-) -> Tuple[VllmOmniTalker, TalkerSpecialTokenIds]:
-    """Load the Talker using vLLM-Omni's native module and kernels.
+) -> Tuple[OmniTalker, TalkerSpecialTokenIds]:
+    """Load the Talker using the engine's native module and kernels.
 
     For tp_size>1 call from each of `world_size` ranks with the shared
     `init_method`, distinct `rank`, and a per-rank `device`.
@@ -715,7 +718,7 @@ def load_vllm_talker_model(
     special = TalkerSpecialTokenIds.from_model_config(full_config)
     torch_device = torch.device(device)
     with torch.cuda.device(torch_device):
-        talker = VllmOmniTalker(
+        talker = OmniTalker(
             model_path=model_path,
             full_config=full_config,
             device=torch_device,
@@ -728,14 +731,14 @@ def load_vllm_talker_model(
             enforce_eager=enforce_eager,
         )
         talker.load_weights_from_checkpoint()
-    logger.info("vLLM-Omni Talker ready on %s (dtype=%s, tp=%d rank=%d)",
+    logger.info("engine Talker ready on %s (dtype=%s, tp=%d rank=%d)",
                 device, dtype, tp_size, rank)
     return talker, special
 
 
 def build_user_part(
     *,
-    talker: VllmOmniTalker,
+    talker: OmniTalker,
     thinker_embed_segment: torch.Tensor,    # [seg_len, thinker_hidden]
     thinker_hidden_segment: torch.Tensor,   # [seg_len, thinker_hidden]
     multimodal_mask_segment: torch.Tensor,  # [seg_len], bool
@@ -769,7 +772,7 @@ def build_user_part(
 
 def build_assistant_parts(
     *,
-    talker: VllmOmniTalker,
+    talker: OmniTalker,
     assistant_thinker_embed: torch.Tensor,  # [seg_len, thinker_hidden]
     speaker_id: int,
     tts_pad_embed: torch.Tensor,            # [1, talker_hidden]
@@ -858,7 +861,7 @@ def build_assistant_parts(
 
 def get_tts_special_embeds(
     *,
-    talker: VllmOmniTalker,
+    talker: OmniTalker,
     tts_bos_thinker: torch.Tensor,
     tts_eos_thinker: torch.Tensor,
     tts_pad_thinker: torch.Tensor,

@@ -27,7 +27,7 @@ class OpType(Enum):
 
     BLACK_BOX: The agent cannot inspect or modify the operator's internals.
         It can only schedule it relative to other operators and choose device
-        placement. Examples: vLLM-served LLM, vLLM-Omni TTS, ASR model.
+        placement. Examples: an engine-served LLM, an omni-engine TTS, ASR model.
 
     EXPOSED: The agent can see the operator's implementation, data flow, and
         memory layout. It can restructure the operator's execution (e.g.,

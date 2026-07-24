@@ -1,96 +1,187 @@
-# wLLM: World and Multimodal Model Serving — 工程规格 v1.0
+# wLLM: Agent-Operable Multimodal Deployment Optimizer — 工程规格 v2.0
 
-> 权威来源：`ref/goal_and_plan_new_wLLM.md`（2026-07-24 用户令）。本文件是其工程化压缩版 + 集群适配。
-> 取代 TESSERA_SPEC.md（其 IR/探针/planner 设计并入本规格；**Tessera 仅保留为 planner 算法名**）。
-> 命名纪律：项目一切交付物（代码/README/注释/文档/测试）**不出现两个上游参考项目的名字**；
-> 内部一律称 `upstream-a`（agent-guided 部署 harness 参考）与 `upstream-b`（kernel/静态图推理引擎参考, Apache-2.0）。
-> 法律底线：凡实际派生/改写 upstream-b 代码的文件，保留 Apache-2.0 许可证头与 NOTICE（许可证合规不等于品牌宣传）。
+> 权威来源：`ref/goal_wLLM_724{,b,c}.md` + `ref/goal_and_plan_wLLM_724{,b}.md`（2026-07-25 用户总任务更新令）。
+> v1.0（World and Multimodal Model Serving）的五大组件（wGraph/Tessera/wRuntime/wKernels/wBench）全部保留，
+> v2.0 在其上确立**产品定位与控制面**：wLLM 不是又一个推理引擎，而是
+> **由 Agent 一句话触发、但不依赖 Agent 正确性的多模态部署优化基础设施**。
+>
+> 命名纪律（红线）：项目一切交付物（代码/README/注释/文档/测试/配置）**不出现任何上游参考项目名词**。
+> 内部只用中性代号：`upstream-a`（agent-guided 部署 harness 参考）、`upstream-b`（kernel/静态图引擎参考, Apache-2.0）、
+> `upstream-c`（模型目录/评测底座参考）。外部引擎一律经环境变量绑定（`docs/ENGINES.md`），
+> push 前必须 `scripts/release_gate.sh --all` 全树 PASS。
+> 法律底线：凡实际派生/改写 upstream-b 代码的文件保留 Apache-2.0 许可证头与 NOTICE（合规≠品牌宣传）。
 
-## 1. 定位与命名
+## 1. 定位（v2 更新的核心）
 
-- **wLLM**（World and Multimodal Model Serving）：面向 world model / video model / MLLM / WAM 的统一自动部署优化框架。README 首屏必须声明 "wLLM is not an LLM-only engine"。
-- 五大组件：**wGraph**（类型化有状态层级 IR）· **Tessera Planner**（规则+求解器+成本模型+agent 混合搜索）· **wRuntime**（分布式执行/流式调度/恢复）· **wKernels**（高性能算子与静态图后端，整合改造 upstream-b）· **wBench**（正确性与性能验证）。
-- 用户面：`wllm doctor / init / optimize / serve`；Python `Application.from_callable`。
-- 目标函数：Π* = argmin_{Π∈L(P,C)} E_w[αL + βG + γM + δK]（L 延迟、G gap/deadline 违约、M 显存、K GPU-秒；L(P,C) 为语义合法方案集）。核心贡献 = **Verified Semantic Deployment Synthesis**。
+- **一句话交互**：用户对 coding agent 说「用 wLLM 优化这个项目，4×H200，优先首帧延迟，质量不降」。
+  Agent 只做四件事：解析意图为 typed spec → 调 `wllm` CLI/API → 展示结果 → （可选）提交 PR。
+- **三条产品公理**：
+  1. *Agent 只表达意图*——判断优化是否合法、是否更快、质量是否保住的，必须是 wLLM 的
+     profiler / planner / verifier，不是 agent 的经验之谈；同一套 CLI 在 CI 无 agent 时必须可独立运行。
+  2. *Registry first, compiler second, agent synthesis last*——先匹配已验证 recipe/后端；
+     匹配不到再做确定性图变换；最后才允许 agent 生成 adapter（且只能写入隔离目录）。
+  3. *一切结论来自真实测量*——编译通过≠成功、静态估计≠成功、agent 宣称≠成功；
+     没有 baseline 对照 + receipt 的加速不存在。
+- 目标函数不变：Π\* = argmin\_{Π∈L(P,C)} E\_w[αL + βG + γM + δK]（L 延迟、G gap/deadline 违约、M 显存、K GPU-秒）。
+  核心贡献 = **Verified Semantic Deployment Synthesis**。
 
-## 2. 两个上游参考的取材（整合不照搬；均不具名）
+## 2. 上游取材与外部引擎纪律
 
-| | upstream-a（harness） | upstream-b（kernel 引擎, Apache-2.0） |
+| 代号 | 继承思路 | 明确不继承 |
 |---|---|---|
-| 继承思路 | reference→IR→合法变体→正确性验证→真实测量；chunk-periodic 状态分类；TTFO/持续率/平滑度三指标分离 | 稳定小 API、显式硬件 dispatch、声明式 WEIGHT_SPEC、calibration cache、静态 CUDA Graph、C ABI、冷/暖/热三相契约、deployment fingerprint |
-| 在 wLLM 中的落点 | wGraph 语义 + wBench 验证环思想 + Tessera 测量门控 | wKernels L3 后端（§11：修改完善后整合其代码，保留许可头）+ wRuntime 冷暖热契约与 fingerprint |
-| 明确不继承 | 用户须写 frontend/adapter/共享内存契约；"≥10 变体测完"硬规则；单一 conda 环境 | 每模型 800-1200 行手工前端成为用户前置成本 |
+| upstream-a | reference→IR→合法变体→正确性验证→真实测量；chunk-periodic 状态分类；TTFO/持续率/平滑度三指标分离 | 用户手写 frontend/adapter/reference 的高接入成本；"≥10 变体测完"硬规则 |
+| upstream-b | 稳定小 API、显式硬件 dispatch、声明式 WEIGHT_SPEC、calibration cache、静态 CUDA Graph、C ABI、冷/暖/热三相契约、deployment fingerprint | 每模型 800–1200 行手工前端成为用户前置成本 |
+| upstream-c | 模型 manifest/资产/证据分层；"catalog 声明 ≠ 实际跑通"的支持分层思想 | 把它当 serving 引擎（它不是） |
 
-## 3. 四级接入（产品核心：门槛递进）
+**外部引擎绑定**（`wllm/engines/` + `docs/ENGINES.md`）：外部 omni 引擎经 `WLLM_OMNI_ENGINE` 解析包名，
+stage-config YAML 用 `__WLLM_OMNI_ENGINE__` 占位符 + `render_stage_config()` 渲染；
+模型底座经 `WLLM_SUBSTRATE_ROOT / _JOB_MODULE / _CKPT_ENV / _UNIFIED_ENV` 绑定。
+未绑定时 **fail closed**（`OmniEngineNotBound` / RuntimeError），绝不静默降级。
 
-- **L0 Opaque**：既有 server / WorldFoundry runner / 官方 CLI 子进程 → 优化 placement/replica/流水/路由/批处理/环境生命周期。目标覆盖绝大多数 runnable entry。`wllm optimize --model worldfoundry:<id> --workload w.yaml --hardware auto`。
-- **L1 Pipeline**：`Application.from_callable(run, example_inputs=...)`（<30 行集成）→ 组件共置/分离、组件级流水、state placement、跨 chunk overlap。
-- **L2 Model-aware**：可见 transformer block/diffusion step/KV/MoE/causal VAE → TP/SP/CP/PP/EP、CUDA Graph、attention backend、KV 量化、step-pipeline。
-- **L3 Kernel-native**：wKernels（upstream-b 改造）后端：pointer-only forward、WEIGHT_SPEC、calibration、整图 capture、C ABI。**可选的最后一步**，绝不是用户前置要求。
+## 3. 控制面（v2 新增，Milestone 16+）
 
-## 4. wGraph（IR）
+### 3.1 Typed OptimizeSpec（Agent Bridge 的唯一产物）
 
-- Region：Sequential / Parallel / Autoregressive / Diffusion / Flow / ChunkRollout / HierarchicalRollout / MultiAgent / Feedback / **Environment / Composition**。循环语义一等公民：AR h_{t+1},y_t=f(h_t,y_{<t},c)；Diffusion z_{k-1}=Φ(z_k,c,k)；WM rollout s_{t+1}=F(s_t,a_t)；WAM a_t=π(o_t,h_t), h_{t+1}=U(h_t,o^real_{t+1})。
-- State 类型：ImmutableSession / RecomputableFeature / KV / Recurrent / RollingContext / Stochastic / FeedbackCritical / DeadlineBound / MultiAgent；字段 scope/ordered/recomputable/migratable/forkable/owner/max_staleness_ms/deadline_policy/memory_bytes/**verified**（探针实证后才可为 true，planner 只消费 verified）。
-- Stream 类型：Token/Latent/Frame/Audio/Action/Control/MultiView；字段 chunk_size/rate_hz/variable_rate/timestamped/**bounded_queue/backpressure(block|drop_oldest|coalesce|reject)**/deadline_ms/sync_group。
-- Quality contract：exact（默认）| bounded_degradation（显式 `--allow-approximate` 才启用近似变换）。
+```yaml
+project: .
+hardware: {accelerator: auto, count: auto}
+objective: {primary: p95_first_output, secondary: [sustained_rate, gpu_seconds]}
+quality:  {policy: exact | bounded, budget: null | {metric: lpips, max: 0.05}}
+contract: {preserve_existing_api: true, required_modalities: [video, audio]}
+budget:   quick | balanced | thorough | {gpu_hours: 2}
+```
+
+优化器只读 typed spec，不读自然语言。
+
+### 3.2 命令面（CI 可独立运行）
+
+```
+wllm inspect .          # 项目发现 → .wllm/manifests/
+wllm baseline .         # 冻结参考基线 → .wllm/baselines/
+wllm optimize .         # 规划+搜索+实测 → .wllm/plans/ + receipts/
+wllm verify <plan>      # 五级验证（wBench）
+wllm apply <plan>       # 生成部署物（不覆盖用户源码）
+wllm rollback           # 回退链 optimized → last-known-good → reference
+wllm report             # 人读报告 + 机器读 JSON
+```
+
+### 3.3 产物目录与 Receipt
+
+```
+.wllm/
+├── manifests/   project|model|hardware|api-contract.json
+├── baselines/   冻结基线（含环境 fingerprint）
+├── plans/       候选方案（YAML，可重放）
+├── receipts/    每个实测方案一张回执
+├── generated/   agent/模板生成物（唯一可写区）
+└── reports/
+```
+
+Receipt 必含：source/ckpt revision、backend+version、硬件/驱动/torch、passes 列表、
+性能分布（p50/p95/p99、cold/warm 分开）、质量结果、**authenticity checks**
+（优化真的启用：cache 命中>0、并行组正确、graph capture 成功、无 fallback 日志）、
+known_limitations、rollback_target。关键字段变化即 fingerprint 失效。
+
+### 3.4 Backend Capability Registry（把经验变成机器可执行）
+
+```yaml
+backend: <id>
+models: {exact: [...], compatible: [...]}
+passes:
+  torch_compile: {quality: exact, conflicts: []}
+  cfg_parallel:  {quality: exact, requires: {min_gpus: 2, model_uses_cfg: true}}
+  fp8:           {quality: bounded, requires: [calibration]}
+invariants:
+  forbidden_log_patterns: ["Falling back to ..."]   # 命中即结果无效（fail-closed）
+```
+
+| skill 式经验 | wLLM 基础设施形式 |
+|---|---|
+| "建议开 torch.compile" | 版本化 pass |
+| "X 与 Y 不能同开" | conflict graph |
+| "看到 fallback 日志就无效" | fail-closed invariant |
+| "agent 判断哪个最快" | 实测 + receipt |
+
+### 3.5 支持分层（禁止模糊的 supported: true）
+
+`Discovered → Cataloged → Launchable → Parity-verified → Optimized-1GPU → Optimized-multiGPU → Serving-verified → Production`。
+每层晋升都要有落盘证据；BETA_REPORT 的 tier ledger 延续此制度。
+
+## 4. wGraph（IR，承自 v1）
+
+- Region：Sequential / Parallel / Autoregressive / Diffusion / Flow / ChunkRollout / HierarchicalRollout / MultiAgent / Feedback / Environment / Composition。循环语义一等公民。
+- State：ImmutableSession / RecomputableFeature / KV / Recurrent / RollingContext / Stochastic / FeedbackCritical / DeadlineBound / MultiAgent；字段 scope/ordered/recomputable/migratable/forkable/owner/max_staleness_ms/deadline_policy/memory_bytes/**verified**（探针实证后 planner 才消费）。
+- Stream：Token/Latent/Frame/Audio/Action/Control/MultiView；bounded_queue + backpressure(block|drop_oldest|coalesce|reject) + deadline_ms + sync_group。
+- Quality contract：exact（默认）| bounded_degradation（显式 `--allow-approximate` 才启用）。
 
 ## 5. 语义恢复（四路融合，contract 落盘可审计）
 
-静态分析（call graph/loop/shape/cache/sampler/mask）→ 动态 tracing（module hooks/CUDA event/NVTX/torch.profiler/可选 FX）→ agent 提议（非标准语义命名假设+置信度）→ **反事实探针裁决**（reset/recompute/reorder/delay/fork/migration）→ `contracts/<model>.yaml`（sidecar，含 probe_evidence 指针）。
+静态分析 → 动态 tracing（hooks/CUDA event/profiler）→ agent 提议（假设+置信度）→ **反事实探针裁决** → `contracts/<model>.yaml`（含 probe_evidence 指针）。
 
-## 6. Tessera Planner（预算受控搜索，不设"测完全队列"硬规则）
+## 6. Tessera Planner（预算受控搜索）
 
-Step1 真实 baseline（warmup 后：stage latency/显存/利用率/传输/同步/质量）→ Step2 按 region+contract 产合法变换（placement/共置/分离/stage overlap/continuous batching/TP-SP-CP-PP-EP/CUDA Graph/attention backend/KV placement/精度/step reduction/pruning）→ Step3 约束过滤（OOM/架构不支持/不可迁移 state/feedback 过期/带宽/静态 shape/质量 contract）→ Step4 低成本估计（microbench τ 表 + 通信模型 + 显存模型 + 历史 plan 库 + 简单 learned 成本模型）→ Step5 **successive halving 逐级实测**（极短 workload 全测 → 淘汰 → 加长 → Pareto 前沿完整稳定性测试）。
-- 用户预算：`wllm optimize --budget 20m|2gpu-hours|thorough`。
-- 输出 Plan A(min TTFT/首帧) / B(max 持续率) / C(min GPU 成本) / D(deadline-safe) / E(bounded-quality)。
-- Exact / Approximate 两张变换表严格分离。
+Step1 真实 baseline → Step2 按 region+contract 产合法变换 → Step3 约束过滤（给拒绝理由）→
+Step4 低成本估计（microbench τ 表+通信/显存模型+plan 历史库）→ Step5 successive halving 逐级实测 → Pareto 前沿。
+- 四级来源顺序：**已验证 recipe → 确定性变换 → 测量驱动搜索 → agent 生成 adapter**（仅限 `.wllm/generated/`，不得触碰 reference/benchmark/verifier/threshold）。
+- Exact / Approximate 两张变换表严格分离；输出 Plan A(min 首帧)/B(max 持续率)/C(min GPU 成本)/D(deadline-safe)/E(bounded-quality)。
 
-## 7. wRuntime
+## 7. wRuntime（承自 v1）
 
-- 进程模型：coordinator + 每 GPU(组) 长驻 worker + **每依赖环境独立 subprocess**（不强求单一环境——异构模型各带各的 env）。
-- 通信 v1：控制 UDS；小数据 shm ring；GPU 张量 torch.distributed/NCCL；跨环境 shm/CUDA IPC。v2：TensorDescriptor 数据面（same-GPU pointer > CUDA IPC > NCCL P2P > pinned host）。
-- **有界队列 + 背压**（每 stream 必填 queue_capacity/overflow/deadline；机器人 action queue=1, reject, stale=never_execute）。
-- **冷/暖/热三相契约**（继承 upstream-b）：COLD 加载/选后端/分配 → WARM 校准/编译/capture/shape bucket → HOT 只更新 buffer 内容+replay，禁止 recapture/allocate/rebind。
-- Deployment fingerprint：source commit/ckpt hash/config/input schema/硬件/驱动/torch/后端版本/精度/shape bucket/stage DAG/state layout——关键字段变化即失效。
-- 自动回退链：optimized plan → last-known-good → reference plan（用户永远有正确路径）。
-- State snapshot（KV/rolling world state/session 元数据/action history 周期快照）；不可恢复态崩溃后显式重启 session。
+coordinator + 每 GPU(组) 长驻 worker + 每依赖环境独立 subprocess；控制 UDS、小数据 shm ring、GPU 张量 NCCL；
+有界队列+背压；冷/暖/热三相契约（HOT 禁 recapture/allocate/rebind）；deployment fingerprint；
+自动回退链 optimized → last-known-good → reference；state snapshot。
+**三种集成模式**：A. API 端点代理（默认，业务代码零改动）；B. import 兼容 shim（一处可回滚 import）；C. 嵌入式自定义图（才需要 reference adapter）。
 
 ## 8. wBench（五级验证 + 按家族指标）
 
-A 结构（无环/state 唯一 owner/shape/deadline 合法）→ B 数值（fixed seed latent allclose/logits 容差/action trace 相等）→ C 应用质量（MLLM bench/视频质量/WM dynamics/机器人成功率）→ D 压力（动态 shape/长跑/队列溢出/reset/session churn/OOM/worker crash）→ E 故障（杀 worker/输入丢失/超时/ckpt 缺失/state 恢复失败）。生产化：shadow → canary 小流量 → 扩大；机器人新 plan 仅 simulator 验证。
-指标族：MLLM(TTFT/inter-token/req/s/首音频包/AV 同步) · Video(首帧/E2E FPS/p95 帧间隔/持续 FPS/VAE 占比/显存/GPU-s per video) · WM(action-to-first-state/rollout steps/s/horizon scaling/branch 吞吐) · WAM(o→a p50-95-99/deadline miss/staleness/idle 占比/成功率)。
+A 结构 → B 数值（fixed-seed latent/logits/action 容差；tie-aware token gate）→ C 应用质量 →
+D 压力（动态 shape/长跑/队列溢出/session churn/OOM/crash）→ E 故障注入。
+指标族：MLLM(TTFT/inter-token/req/s/AV 同步) · Video(首帧/E2E FPS/p95 帧间隔/GPU-s per video) ·
+WM(action-to-first-state/rollout steps/s/branch 吞吐) · WAM(o→a p50-95-99/deadline miss/staleness/成功率)。
+已沉淀 Verifier Laws（BETA_REPORT）：编译扩散按轨迹发散须实证分类；tie 是仲裁不是发散；
+reference=ckpt 声明精度；batching 改变结果但分布可不变。
 
-## 9. 里程碑（用户日历）
+## 9. 质量工程（v2 新增强制）
 
-**Alpha（3 天）**：WorldFoundry catalog 读取；runnable entry 皆可 opaque；本地 PyTorch callable；wGraph v0；baseline profiler；exact placement/pipeline 搜索；reference fallback。模型（以可得性审计为准）：Cosmos3-Nano / SANA-Streaming / Wan2.1-2.2 / OpenVLA / Qwen3-Omni（或 Qwen2.5-Omni 替补）。**性能门槛：≥3 模型自动找到优于 baseline 的 plan；代表 workload 中位 E2E ≥1.3×；自动方案 ≥专家 80-90%；exact plan 零功能回退。使用门槛：WF 模型 10 min 首个 baseline；普通 pipeline <30 行接入；不写 frontend/adapter。**
-**Beta（2 周）**：AR/diffusion/hybrid、causal streaming、TP/SP/CP/PP、CUDA Graph、shape bucket、多环境 worker、质量 contract、plan cache；深适配 10-12 模型；24h soak / crash 恢复 / OOM 回退 / fingerprint 失效正确。
-**1.0（9-12 周）**：Feedback/MultiAgent region、WAM deadline scheduler、approximate（FP8/NVFP4/KV 量化）、可选 L3 native 后端、在线 plan 路由、N+A 双硬件。覆盖 WorldFoundry 大部分模型（范围参照，不需要特别声明）。
+- **单元/回归**：`tests/`（pytest 兼容 + 独立 `__main__` runner，登录节点禁跑 → CPU sbatch `slurm/wllm_ci_cpu.sbatch`）。
+- **BDD 验收**：`tests/features/*.feature`（gherkin）+ `tests/test_bdd_scenarios.py` 步骤实现，
+  覆盖 inspect→baseline→optimize→verify→apply→rollback 全链路与 fail-closed 场景。
+- **Mutation smoke**：`scripts/mutation_smoke.py` 对控制面核心（registry 约束过滤/receipt 校验/回退链）注入变异，
+  要求测试套件杀死率 ≥ 阈值（初始 ≥80%）。
+- **Coverage 门控**：控制面新代码行覆盖 ≥85%（`coverage.py`，CPU job 产出 `.wllm/reports/coverage.txt`）。
+- **命名门控**：`release_gate.sh`（staged）与 `--all`（全树）双模式，push 前两者必 PASS。
+- **/verify 三闸**：提交前、阶段切换、错误修复后。
 
-## 10. 目录结构（原创）
+## 10. 里程碑
+
+**已完成（M1–M15，全部有 SLURM job 证据）**：wGraph v0 + planner v0 + L0/L1 + catalog importer(258/258)；
+successive-halving；drift-gated verdicts；双引擎统一；Alpha 3 模型中位 2.75×；
+CFG branch-parallel 1.74× bit-exact（2 GPU）；全管线 1.44× bit-exact；Qwen3-VL 2.75×（tie-aware exact）；
+OpenVLA 4.59×（native bf16）；E2E app Launchable（704 帧）；Hopper probe tier；两环境 VLA bridge。
+**M16（本轮）**：命名纪律全树清零 + 控制面 v0（OptimizeSpec/inspect/registry/receipts/apply/rollback）+ BDD/mutation/coverage 门控。
+**M17+**：控制面接通真实 plan 重放（Wan2.2 CFG-parallel receipt 化）；MCP server 入口；
+qwen3_omni/liveavatar 权重落地 → Launchable 复制；24h soak + 故障注入（Beta 收口）。
+**1.0（9–12 周）**：Feedback/MultiAgent region、WAM deadline scheduler、approximate（FP8/NVFP4/KV 量化）、
+可选 L3 native 后端、在线 plan 路由、双硬件家族。
+
+## 11. 目录结构
 
 ```
 wllm-infra/
 ├── WLLM_SPEC.md
-├── wllm/                      # pip 包（原 tessera/ 规划并入）
-│   ├── graph/     regions.py states.py streams.py quality.py program.py
-│   ├── capture/   static_scan.py trace.py hypothesis.py probes.py lifter.py
-│   ├── contracts/ schema.py store.py
-│   ├── planner/   transforms.py rules.py constraints.py cost_model.py search.py pareto.py budget.py
-│   ├── runtime/   coordinator.py worker.py spec.py stage_pipeline.py transport.py
-│   │              state_manager.py lifecycle.py fingerprint.py fallback.py
-│   ├── backends/  torch_local/ worldfoundry/ subprocess_cli/ vllm/ sglang/ native/(=wKernels 接口)
-│   ├── kernels/   # upstream-b 改造整合（保留 Apache-2.0 头）
-│   ├── verify/    structural.py numerical.py quality.py stress.py fault.py
-│   ├── profiling/ microbench.py report.py
-│   ├── serve/     http.py openai_compat.py ws.py cli.py(doctor/init/optimize/serve)
-│   └── apps/      # 场景应用（含示例 workload）
-├── contracts/<model>.yaml     # sidecar
-├── tests/  benchmarks/(results 留盘)  inventory/  slurm/  logs/  docs/  checkpoints/
-├── upstream-a/  upstream-b/   # 只读参考镜像
-└── worldfoundry-upstream/     # 上游镜像
+├── wllm/
+│   ├── graph/ capture/ contracts/ planner/ runtime/ verify/ profiling/
+│   ├── control/     spec.py inspect.py registry.py receipt.py apply.py cli.py   # v2 控制面
+│   ├── engines/     omni.py            # 外部引擎 env 绑定（不具名）
+│   ├── backends/    torch_local/ catalog/ subprocess_cli/ native/
+│   ├── kernels_t/   serving/  native/  apps/
+│   └── serve/
+├── contracts/  tests/(features/)  benchmarks/  inventory/(README only)  slurm/  logs/  docs/
+└── upstream-a|b|c/              # 只读参考镜像（gitignored, 永不入库）
 ```
 
-## 11. 集群适配与红线（不变）
+## 12. 集群适配与红线（不变）
 
-sbatch-only、GPU 双上限 72/112、利用率红线（常驻 worker 配 keepalive 或短时限任务化）、复提门控、/verify 过闸；权重 ModelScope 优先；H200：FP8 可用、NVFP4 不可用（Blackwell-only → fallback FP8/BF16 路径必须存在）；env 用共享 FS python 建 .venv（绕 conda 锁），多环境 worker 天然匹配本集群多 env 现实。
+sbatch-only（登录节点连 python 脚本都禁跑 → CI 走 CPU sbatch）、GPU 双上限 72/112、利用率红线、
+复提门控、/verify 过闸；权重 ModelScope 优先；H200：FP8 可用、NVFP4 不可用（fallback 路径必须存在）；
+.venv 用共享 FS python；多环境 worker 天然匹配本集群多 env 现实。

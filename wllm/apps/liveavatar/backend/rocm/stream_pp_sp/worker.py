@@ -7,7 +7,7 @@ latency-to-first-output still includes the *full* TTS wait: the base worker
 generates the entire TTS audio before the DiT starts. This variant removes that
 wait — it drives the 2-stage×sp3 pipeline directly from the TTS stream, starting
 the DiT on the first 480 ms of TTS audio while TTS keeps generating the rest in its
-own vLLM-Omni process. wav2vec offload (L6) is intentionally NOT included: it was
+own engine process. wav2vec offload (L6) is intentionally NOT included: it was
 measured inert (the DiT, not wav2vec, is the bottleneck) and there is no free GPU
 on the 8-GPU layout anyway.
 

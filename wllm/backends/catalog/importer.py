@@ -1,7 +1,10 @@
-"""Catalog importer for the WorldFoundry model substrate.
+"""Catalog importer for an external model-substrate checkout.
 
-Reads catalog manifests (heterogeneous YAML generations) into one
-normalized CatalogEntry shape and emits a machine-readable inventory.
+Reads model-catalog manifests (heterogeneous YAML generations) from a
+locally installed substrate checkout into one normalized CatalogEntry
+shape and emits a machine-readable inventory. Point ``repo_root`` (or
+``WLLM_SUBSTRATE_ROOT``) at the checkout; the manifest tree is located
+automatically.
 
 Normalization policy: the YAML files are the source of truth; generated
 doc indexes lag them.  Manifests span multiple schema generations, so
@@ -167,10 +170,30 @@ def parse_manifest(path: Path, category: str) -> CatalogEntry:
     return entry
 
 
+def find_catalog_dir(root: Path) -> Path:
+    """Locate the substrate's model-manifest tree under ``root``.
+
+    Accepts either the package directory itself or a checkout root whose
+    top-level children contain the package; manifests live at
+    ``<package>/data/models/catalog``. Returns a deterministic (possibly
+    non-existent) path when nothing matches, so ``load()`` simply yields
+    zero manifests instead of crashing.
+    """
+    direct = root / "data" / "models" / "catalog"
+    if direct.is_dir():
+        return direct
+    if root.is_dir():
+        for child in sorted(p for p in root.iterdir() if p.is_dir()):
+            cand = child / "data" / "models" / "catalog"
+            if cand.is_dir():
+                return cand
+    return direct
+
+
 class CatalogImporter:
     def __init__(self, repo_root: str | Path):
         self.root = Path(repo_root)
-        self.catalog_dir = self.root / "worldfoundry/data/models/catalog"
+        self.catalog_dir = find_catalog_dir(self.root)
         self.errors: list[tuple[str, str]] = []
 
     def commit_sha(self) -> str | None:

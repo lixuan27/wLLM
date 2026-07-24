@@ -5,8 +5,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from wllm.backends.worldfoundry.importer import CatalogEntry
-from wllm.backends.worldfoundry.runner import (
+from wllm.backends.catalog.importer import CatalogEntry
+from wllm.backends.catalog.runner import (
     SubstrateInstall, build_infer_spec, resolve_env_name,
 )
 from wllm.planner.plan import DeploymentPlan, Stage
@@ -92,27 +92,42 @@ def _entry(env=""):
 
 
 def test_env_resolution():
-    inst = SubstrateInstall(repo_root="/tmp/wf")
+    inst = SubstrateInstall(repo_root="/tmp/substrate")
     assert resolve_env_name(_entry(""), inst) == inst.unified_env
     assert resolve_env_name(_entry("_unified"), inst) == inst.unified_env
     assert resolve_env_name(_entry("special-env"), inst) == "special-env"
 
 
+def test_build_infer_spec_requires_job_module():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        inst = SubstrateInstall(repo_root=td, job_module="")
+        try:
+            build_infer_spec(_entry(), inst, output_dir=f"{td}/out")
+        except RuntimeError as exc:
+            assert "job_module" in str(exc)
+        else:
+            raise AssertionError("missing job_module must fail closed")
+
+
 def test_build_infer_spec_shape(tmp_path=None):
     import tempfile
     with tempfile.TemporaryDirectory() as td:
-        inst = SubstrateInstall(repo_root=td, ckpt_dir=f"{td}/ckpts")
+        inst = SubstrateInstall(
+            repo_root=td, ckpt_dir=f"{td}/ckpts",
+            job_module="substrate_pkg.studio.workspace_job",
+            ckpt_env_var="SUBSTRATE_CKPT_DIR")
         spec = build_infer_spec(_entry(), inst, output_dir=f"{td}/out",
                                 prompt="hello", gpu_indices=[2],
                                 extra_args=["--frames", "17"])
         argv = spec.argv
         assert argv[:4] == ["conda", "run", "--no-capture-output", "-n"]
-        assert "worldfoundry.studio.workspace_job" in argv
+        assert "substrate_pkg.studio.workspace_job" in argv
         assert "--model-id" in argv and "demo-model" in argv
         assert "--prompt" in argv and "hello" in argv
         assert argv[-2:] == ["--frames", "17"]
         assert spec.gpu_indices == [2]
-        assert spec.env["WORLDFOUNDRY_CKPT_DIR"] == f"{td}/ckpts"
+        assert spec.env["SUBSTRATE_CKPT_DIR"] == f"{td}/ckpts"
         assert Path(f"{td}/out").is_dir()   # created eagerly
         assert spec.artifacts[0].kind == "output_dir"
 

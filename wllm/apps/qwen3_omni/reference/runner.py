@@ -1,8 +1,8 @@
 """Streaming Qwen3-Omni Talker runner.
 
-Drives the in-process vLLM-Omni Talker adapter one codec frame at a
+Drives the in-process engine Talker adapter one codec frame at a
 time so the worker can interleave thinker token arrivals with talker
-codec generation while keeping scheduling outside vLLM-Omni.
+codec generation while keeping scheduling outside the engine.
 
 Per-step protocol mirrors the Qwen3-Omni Talker generation loop:
 
@@ -125,7 +125,7 @@ class Qwen3OmniTalkerRunner:
         )
 
         logger.info(
-            "Building Talker from vLLM-Omni internals "
+            "Building Talker from engine internals "
             "(single-request manual scheduler)",
         )
         self.talker, self.special = load_vllm_talker_model(
@@ -175,7 +175,7 @@ class Qwen3OmniTalkerRunner:
         )
 
         torch.cuda.empty_cache()
-        logger.info("Talker uses vLLM-Omni compile and CUDA graph paths")
+        logger.info("Talker uses the engine's compile and CUDA graph paths")
 
         # Eager warmup: trigger torch.compile cold-start NOW, during the
         # backend init, so the first user prompt isn't paying ~30-45 s
@@ -198,7 +198,7 @@ class Qwen3OmniTalkerRunner:
     ) -> int:
         """Resolve total Talker context length.
 
-        vLLM-Omni treats ``max_tokens`` as generated codec frames, while
+        The engine treats ``max_tokens`` as generated codec frames, while
         the model's KV cache also has to hold prompt/prefill positions.
         Keep a prompt headroom margin by default so a 4096-token Talker
         generation does not run into a 4096-position cache.
@@ -320,7 +320,7 @@ class Qwen3OmniTalkerRunner:
                     _time.time() - t0,
                 )
 
-                # 3) vLLM-Omni CodePredictor (its AR loop covers every
+                # 3) engine CodePredictor (its AR loop covers every
                 #    intra-loop seq_len in one call).
                 t0 = _time.time()
                 dummy_code = torch.zeros(
@@ -738,7 +738,7 @@ class Qwen3OmniTalkerRunner:
         #    ``codec_embedding`` ModuleList which embeds residual codes).
         layer0_embed = self.talker.get_input_embeddings()(first_layer_token)
 
-        # 3) MTP residual codes via vLLM-Omni's CodePredictor. Returns
+        # 3) MTP residual codes via the engine's CodePredictor. Returns
         #    all RVQ codes plus the summed next-talker-input embedding.
         last_layer_hidden = self._last_hidden[-1][:, -1:].to(
             device=layer0_embed.device, dtype=layer0_embed.dtype,
@@ -849,7 +849,7 @@ class Qwen3OmniTalkerRunner:
         # torch.multinomial to avoid a CPU/GPU sync. For batch size 1 with
         # a request generator, random_sample() does not touch the default
         # CUDA RNG; preserve that so the following CodePredictor multinomial
-        # sees the same worker RNG state as vLLM-Omni.
+        # sees the same worker RNG state as the engine.
         q = torch.empty_like(probs)
         if generator is not None:
             q[0].exponential_(generator=generator)

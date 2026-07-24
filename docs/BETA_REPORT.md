@@ -50,9 +50,9 @@ project promised: no blanket "supported".
 |---|---|---|
 | longlive app | **Launchable** | job 196229: speech→VAD→ASR (verbatim)→prompt→DiT→VAE→704 frames→clean exit |
 | worldplay app | Cataloged | needs HY-WorldPlay 42 GB (HF-proxy only) + converter (in-tree, dogfooded) |
-| liveavatar app | Cataloged | needs Wan2.2-S2V-14B + LoRA + vLLM/vLLM-Omni engines |
+| liveavatar app | Cataloged | needs Wan2.2-S2V-14B + LoRA + the external omni serving engine |
 | krea_sam app | Cataloged | needs Krea 14B + SAM3 |
-| qwen3_omni app | Cataloged | needs vLLM-Omni engine build |
+| qwen3_omni app | Cataloged | needs the external omni engine build |
 | serving runtime | Import-healthy (87%) + Launchable-proven | portability family landed (SDPA backend, RMSNorm fallback, ASR sdpa ×5) |
 | native engine | **Hopper probe tier** | SM90 dispatch + clean import chain on H200; remaining: lerobot processor-JSON stats in loader; csrc build only for FP8/FP4 fast paths |
 | Matrix-Game-2.0 | Discovered | weights local (8.4 GB); needs official pipeline code + distilled-weight completion |

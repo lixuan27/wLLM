@@ -1,8 +1,5 @@
 # --- never publish: reference mirrors & local-only material ---
-upstream-a/
-upstream-b/
-worldfoundry-upstream/
-WorldFoundry-main/
+upstream-*/
 ref/
 target-coverage/
 docs/paper_analysis.md
@@ -11,7 +8,9 @@ docs/codebase_apps.md
 docs/codebase_upstream_b.md
 docs/improvement_blueprint.md
 TESSERA_SPEC.md
-inventory/availability_audit_2026-07-24.md
+inventory/*.json
+inventory/*.md
+!inventory/README.md
 
 # --- runtime / state ---
 .deli/
@@ -26,3 +25,6 @@ __pycache__/
 wf.tar.gz
 *.tar.gz
 native/third_party/
+.wllm/
+.wllm.env
+native/wllm_native/

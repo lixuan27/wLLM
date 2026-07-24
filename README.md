@@ -1,7 +1,11 @@
-# wLLM: World and Multimodal Model Serving
+# wLLM: Agent-Operable Deployment Optimizer for World & Multimodal Models
 
-> **wLLM is not an LLM-only engine.** It deploys autoregressive, diffusion,
-> video, world, and world-action models — automatically.
+> **wLLM is not an LLM-only engine — and not another inference engine.**
+> Tell your coding agent *"optimize this project with wLLM"* and a real,
+> agent-independent infrastructure inspects the project, plans legal
+> optimizations, measures them, verifies quality, and leaves a receipt
+> and a rollback path. The agent expresses intent; wLLM decides what is
+> true.
 
 Given a runnable multimodal model (an MLLM, a video generator, an
 interactive world model, or a world-action policy), a target hardware
@@ -9,14 +13,37 @@ environment, and a set of SLOs, **wLLM synthesizes a verified, efficient
 deployment plan** — placement, parallelism, streaming, batching — with
 correctness, quality, and safety evidence attached to every plan.
 
+## One sentence in, receipts out
+
+```text
+User → agent : "Optimize this video project. 4 GPUs, first-frame
+                latency first, no quality loss."
+Agent → wLLM : a typed OptimizeSpec + CLI calls (nothing else)
+wLLM         : inspect → baseline → legal candidates → real measurement
+               → quality gates → receipt → apply (reversible)
+```
+
+```bash
+wllm inspect  .                          # evidence-listing project manifest
+wllm plan     . --model <id> --spec s.yaml   # backends + legal passes (+why rejected)
+wllm verify   --receipt r.json           # promote gate: measured, authentic, no fallback
+wllm apply    . --receipt r.json         # fail-closed promotion
+wllm rollback .                          # optimized → last-known-good → reference
+wllm report   .
+```
+
+The same commands run identically in CI with no agent present — if it
+only works when a model is improvising, it is a prompt, not infra.
+
 ## Components
 
 | Component | Role |
 |---|---|
+| **Control plane** | Typed OptimizeSpec, project inspector (absence recorded, never guessed), declarative backend-capability registry (requires/conflicts/fail-closed log invariants), measured receipts with deployment fingerprints, apply/rollback state machine |
 | **wGraph** | Typed, stateful, hierarchical IR: execution regions (AR / diffusion / chunk-rollout / multi-agent / feedback), semantic state contracts (KV / recurrent / rolling-context / feedback-critical, with `verified` probe gating), rate-and-deadline-aware streams, exact-vs-bounded quality contracts |
 | **Tessera Planner** | Budget-controlled deployment search: rule-based candidates from region semantics → constraint filtering (memory / state placement / deadlines, with rejection reasons) → analytic cost model (critical-path latency, bottleneck-resource period) → successive-halving measurement |
 | **wRuntime** | Reference executor (always-correct fallback anchor), staged pipelines, cold/warm/hot lifecycle contract, deployment fingerprinting, plan fallback chain |
-| **wBench** | Five-level verification: structural → numerical (fixed-seed) → application quality → stress → fault |
+| **wBench** | Five-level verification: structural → numerical (fixed-seed, tie-aware) → application quality → stress → fault |
 
 ## Integration levels
 
@@ -30,9 +57,42 @@ correctness, quality, and safety evidence attached to every plan.
 - **L3 Kernel-native** — optional static-graph fast path (CUDA-graph
   capture, declarative weight mapping) for the hottest models.
 
-Model support is reported honestly in six tiers —
-`Discovered / Launchable / Profiled / Structure-aware / Optimized / Verified`
+Model support is reported honestly in tiers —
+`Discovered / Cataloged / Launchable / Parity-verified / Optimized / Serving-verified`
 — never as a blanket "supported".
+
+## Measured results so far (1–2× H200, all with on-disk evidence)
+
+| Model | Best plan | Verdict |
+|---|---|---|
+| video 5B (TI2V) | CFG branch-parallel, 2 GPU | **1.44× E2E, frame-level bit-exact** |
+| VLM 8B | static KV cache | **2.75×**, tie-aware exact (top-2 logit gap = 0.0 proven) |
+| VLA 7B | native checkpoint precision | **4.59×** vs naive fp32 (the fp32 upcast was the variant, not the oracle) |
+
+## Design principles
+
+1. **Measured or it didn't happen** — plans are ranked by a cost model but
+   promoted only by real end-to-end measurement; a receipt without
+   performance distributions is void.
+2. **Fail closed** — a silent fallback in the logs invalidates the whole
+   result; authenticity checks must prove the optimization was active;
+   an unknown model gets diagnose-only mode, never a fake win.
+3. **Verified contracts only** — an agent hypothesis about state semantics
+   never unlocks a transformation; counterfactual probes do.
+4. **Always a correct path** — optimized plan → last-known-good →
+   reference; the user is never stranded.
+
+## Quality engineering
+
+```bash
+sbatch slurm/wllm_ci_cpu.sbatch   # or run the steps directly on any CPU box
+```
+
+The CI battery: naming/secret release gate → full syntax sweep → unit +
+integration tests (pytest) → gherkin BDD scenarios driving the real CLI
+(`tests/features/*.feature`, zero-dependency runner) → coverage gate
+(control plane ≥ 85%) → mutation smoke (AST mutants of the fail-closed
+core; kill rate ≥ 80% required).
 
 ## Quick start (developer preview)
 
@@ -45,27 +105,17 @@ plans  = app.optimize(objective="first-output-latency", num_gpus=4)
 print(plans.report())                                   # kept + rejected(why)
 ```
 
-```bash
-python -m pytest tests/          # 28 tests and counting
-```
-
-## Design principles
-
-1. **Measured or it didn't happen** — plans are ranked by a cost model but
-   promoted only by real end-to-end measurement.
-2. **Verified contracts only** — an agent hypothesis about state semantics
-   never unlocks a transformation; counterfactual probes do.
-3. **Honest surfaces** — an opaque node exposes placement optimization
-   only; wLLM never fabricates parallelism it cannot prove legal.
-4. **Always a correct path** — optimized plan → last-known-good →
-   reference; the user is never stranded.
+External engines and model substrates are bound by environment variables,
+never imported by name — see `docs/ENGINES.md`.
 
 ## Status
 
-Developer preview (alpha). Current coverage: catalog import for a
-258-entry external model substrate, L0/L1 integration, toy-level exact
-planning verified end-to-end, first real-model baselines in progress on
-8× H200. APIs will change.
+Developer preview (alpha → beta). Current coverage: control plane v0
+(inspect/plan/verify/apply/rollback + capability registry + receipts),
+catalog import for a 258-entry external model substrate, L0/L1
+integration, measured exact-plan speedups on three real models (table
+above), first end-to-end app Launchable on the unified runtime. APIs
+will change.
 
 ## License
 

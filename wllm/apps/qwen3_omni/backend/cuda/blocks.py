@@ -11,13 +11,13 @@ runner verbatim. Variants that need to change a stage's internals (e.g.
 Talker tensor parallelism) vendor + modify their own copy instead.
 
 Stage map:
-  * Thinker  : vLLM-Omni AsyncOmni engine (BLACK_BOX). run_thinker ->
+  * Thinker  : external AsyncOmni engine (BLACK_BOX). run_thinker ->
                ThinkerOutput (tokens + per-token thinker embed/hidden
                tables + tts markers).
   * Talker   : in-process Qwen3OmniTalkerRunner (EXPOSED). prime_talker
                primes a session from a ThinkerOutput; the runner then
                emits one codec frame per step().
-  * Code2Wav : vLLM-Omni AsyncOmni engine (BLACK_BOX). vocode_full
+  * Code2Wav : external AsyncOmni engine (BLACK_BOX). vocode_full
                (single request, reference behavior) or vocode_chunk
                (streaming, with left context).
 """
@@ -33,7 +33,9 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 
-from vllm_omni import AsyncOmni
+from wllm.engines import omni as omni_engine
+
+AsyncOmni = omni_engine.async_engine_cls()
 from vllm.sampling_params import SamplingParams
 
 from wllm.serving.logger import init_logger
@@ -56,7 +58,7 @@ logger = init_logger(__name__)
 
 # Mirror wllm/apps/qwen3_omni/reference/worker.py::_init_engines: the Code2Wav
 # stage config sets max_model_len=131072 (> the model's 65536 position
-# limit) so the engine subprocess needs this flag, and vLLM-Omni spawns
+# limit) so the engine subprocess needs this flag, and the engine spawns
 # child workers per engine.
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
@@ -112,7 +114,7 @@ def make_thinker_engine(cfg: Qwen3OmniReferenceConfig,
         with removed_envs(*_DIST_ENV_KEYS):
             engine = AsyncOmni(
                 model=cfg.thinker.model_path,
-                stage_configs_path=scp,
+                stage_configs_path=omni_engine.render_stage_config(scp),
                 trust_remote_code=True,
                 **cfg.thinker.extra_engine_kwargs,
             )
@@ -286,7 +288,7 @@ def make_c2w_engine(cfg: Qwen3OmniReferenceConfig,
         with removed_envs(*_DIST_ENV_KEYS):
             engine = AsyncOmni(
                 model=cfg.code2wav.model_path,
-                stage_configs_path=scp,
+                stage_configs_path=omni_engine.render_stage_config(scp),
                 trust_remote_code=True,
                 **cfg.code2wav.extra_engine_kwargs,
             )

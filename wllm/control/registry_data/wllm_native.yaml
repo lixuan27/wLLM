@@ -1,0 +1,25 @@
+# In-house kernel-native static-graph engine (L3 fast path).
+backend: wllm-native
+version: "0.0.1a0"
+models:
+  exact:
+    - openvla/openvla-7b
+  compatible:
+    - "*pi0*"
+modalities:
+  input: [text, image]
+  output: [action]
+passes:
+  native_bf16:
+    quality: exact
+    notes: checkpoint-declared precision is the reference (4.59x vs naive fp32)
+  full_graph_capture:
+    quality: exact
+    requires: {static_shapes: true}
+  fp8_fast_path:
+    quality: bounded
+    requires: {hopper_or_newer: true}
+invariants:
+  forbidden_log_patterns:
+    - "kernel dispatch fell back to torch"
+    - "calibration cache miss, using identity scales"

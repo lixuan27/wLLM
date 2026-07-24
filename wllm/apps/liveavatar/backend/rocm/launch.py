@@ -99,7 +99,7 @@ REGISTRY = {
 
 
 def _raise_omni_handshake_timeout() -> None:
-    """Give the vLLM-Omni stage handshake longer than its 600 s default.
+    """Give the omni-engine stage handshake longer than its 600 s default.
 
     A cold first launch autotunes kernels and warms up graphs for the TTS
     token2wav stage, which can outlast the hardcoded handshake timeout and
@@ -107,7 +107,8 @@ def _raise_omni_handshake_timeout() -> None:
     changes. Override with WLLM_OMNI_HANDSHAKE_TIMEOUT_S.
     """
     try:
-        import vllm_omni.engine.stage_engine_core_proc as stage_proc
+        from wllm.engines import omni as omni_engine
+        stage_proc = omni_engine.submodule("engine.stage_engine_core_proc")
 
         stage_proc._HANDSHAKE_POLL_TIMEOUT_S = int(
             os.environ.get("WLLM_OMNI_HANDSHAKE_TIMEOUT_S", "1800")

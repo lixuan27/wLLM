@@ -1,0 +1,38 @@
+# In-house serving runtime (AR + diffusion + streaming apps).
+backend: wllm-serving
+version: "0.0.1a0"
+models:
+  exact:
+    - Wan-AI/Wan2.2-TI2V-5B
+    - Qwen/Qwen3-VL-8B-Instruct
+  compatible:
+    - Wan-AI/*
+    - Qwen/*
+modalities:
+  input: [text, image, video, audio]
+  output: [text, image, video, audio]
+passes:
+  static_kv_cache:
+    quality: exact
+    notes: measured 2.75x on the 8B VLM with a tie-aware exact verdict
+  cfg_branch_parallel:
+    quality: exact
+    requires: {min_num_gpus: 2, model_uses_cfg: true}
+    notes: one CFG branch per GPU is bit-identical; batched CFG is not
+  torch_compile_max_autotune:
+    quality: bounded
+    conflicts: [cuda_graph_capture]
+    notes: bf16 fusion reordering drifts diffusion trajectories (measured)
+  cuda_graph_capture:
+    quality: exact
+    requires: {static_shapes: true}
+  async_output_materialization:
+    quality: exact
+  layerwise_offload:
+    quality: exact
+    conflicts: [cuda_graph_capture]
+invariants:
+  forbidden_log_patterns:
+    - "falling back to eager"
+    - "fallback to reference pipeline"
+    - "attention backend unavailable, using sdpa fallback"

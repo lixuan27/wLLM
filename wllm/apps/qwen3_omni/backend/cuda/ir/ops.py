@@ -3,7 +3,7 @@
 Two families:
 
 * **Worker-level ops** (`ThinkerOp`, `TalkerOp`, `Code2WavOp`) — the three
-  high-level stages. Thinker and Code2Wav are BLACK_BOX (vLLM-Omni
+  high-level stages. Thinker and Code2Wav are BLACK_BOX (engine
   engines); Talker is EXPOSED (in-process runner, decomposed below).
   Connected by STREAMING edges: thinker emits text tokens incrementally
   (variable rate), talker emits codec frames at a fixed 12.5 Hz that
@@ -41,7 +41,7 @@ from wllm.apps.qwen3_omni.backend.cuda import blocks
 # ======================================================================
 
 class ThinkerOp(IROperator):
-    """BLACK_BOX vLLM-Omni Thinker. text -> ThinkerOutput (streaming text)."""
+    """BLACK_BOX engine Thinker. text -> ThinkerOutput (streaming text)."""
 
     def __init__(self) -> None:
         super().__init__(
@@ -83,7 +83,7 @@ class TalkerOp(IROperator):
 
 
 class Code2WavOp(IROperator):
-    """BLACK_BOX vLLM-Omni vocoder. list[codec_frame] -> audio samples."""
+    """BLACK_BOX engine vocoder. list[codec_frame] -> audio samples."""
 
     def __init__(self) -> None:
         super().__init__(

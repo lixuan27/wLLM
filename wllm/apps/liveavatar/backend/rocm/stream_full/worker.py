@@ -3,7 +3,7 @@
 IR basis: the worker-graph `tts -> liveavatar` streaming edge (VARIABLE_RATE). The
 reference (and stream_liveavatar) wait for the ENTIRE TTS audio before starting the
 LiveAvatar DiT; here the DiT starts on the FIRST 480 ms of TTS audio while TTS keeps
-generating the rest. Because the TTS engine is a separate vLLM-Omni process, it
+generating the rest. Because the TTS engine is a separate engine process, it
 produces the remaining audio in the background while pipe.step() blocks cuda:0, so
 TTS and the DiT overlap for free. Attacks latency-to-first-output (removes the
 full-TTS wait) beyond stream_liveavatar.

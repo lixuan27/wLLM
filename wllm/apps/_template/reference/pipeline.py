@@ -3,7 +3,7 @@
 String the app's model stages together here, strictly one after another, on
 one GPU. Reuse the shared runtime where it fits: model runners under
 ``wllm/runner/`` (DiT, VAE, text encoder), model implementations under
-``wllm/models/``, and external engines (vLLM, vLLM-Omni) for stages
+``wllm/models/``, and external engines (external AR/omni engines) for stages
 served as black boxes. Clarity beats speed — this pipeline is the
 correctness oracle the optimization agent validates its variants against.
 

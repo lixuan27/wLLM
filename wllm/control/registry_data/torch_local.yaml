@@ -1,0 +1,11 @@
+# Reference execution: always-correct fallback anchor, never optimized.
+backend: torch-local
+version: "0.0.1a0"
+models:
+  compatible: ["*"]
+modalities:
+  input: [text, image, video, audio, action, latent]
+  output: [text, image, video, audio, action, latent]
+passes: {}
+invariants:
+  forbidden_log_patterns: []

@@ -11,7 +11,7 @@
 # in layer-major order and supplied as `prompt_token_ids`. Outputs are
 # audio chunks streamed back as a list of waveforms.
 #
-# Differences vs. vllm_omni/model_executor/stage_configs/qwen3_omni_moe_async_chunk.yaml
+# Differences vs. the engine's stock qwen3_omni_moe_async_chunk stage config
 # stage 2:
 #   - dropped `engine_input_source` and stage 1 connectors: this stage
 #     stands alone and is fed by our orchestrator directly
@@ -30,7 +30,7 @@ stage_args:
       max_num_seqs: 64
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: generation
-      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      scheduler_cls: __WLLM_OMNI_ENGINE__.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       enforce_eager: true
       trust_remote_code: true
       async_scheduling: false

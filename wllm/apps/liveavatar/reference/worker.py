@@ -10,14 +10,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchaudio
-import vllm_omni
+from wllm.engines import omni as omni_engine
 from qwen_asr import Qwen3ASRModel
 from transformers import AutoTokenizer, Wav2Vec2Model, Wav2Vec2Processor
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.sampling_params import SamplingParams
-from vllm_omni import AsyncOmni
-from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import Qwen3TTSTalkerForConditionalGeneration
+AsyncOmni = omni_engine.async_engine_cls()
+Qwen3TTSTalkerForConditionalGeneration = omni_engine.attr(
+    "model_executor.models.qwen3_tts.qwen3_tts_talker",
+    "Qwen3TTSTalkerForConditionalGeneration",
+)
 
 from wllm.serving.channels.shm_channel.control_buffer import SharedControlBuffer
 from wllm.serving.channels.shm_channel.tensor_buffer import SharedTensorBuffer
@@ -228,7 +231,7 @@ class LiveAvatarWorker:
             tts_stage_config_path = self.cfg.tts_stage_configs_path
         else:
             tts_stage_config_path = os.path.join(
-                os.path.dirname(vllm_omni.__file__),
+                os.path.dirname(omni_engine.package().__file__),
                 "model_executor/stage_configs/qwen3_tts.yaml",
             )
 

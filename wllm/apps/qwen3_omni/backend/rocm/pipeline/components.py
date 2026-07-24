@@ -34,7 +34,9 @@ from typing import Any, Iterable, List, Optional, Tuple
 import numpy as np
 import torch
 
-from vllm_omni import AsyncOmni
+from wllm.engines import omni as omni_engine
+
+AsyncOmni = omni_engine.async_engine_cls()
 from vllm.sampling_params import SamplingParams
 
 from wllm.serving.logger import init_logger
@@ -243,7 +245,7 @@ class ThinkerComponent:
                         cfg.model_path, self._device_str())
             self.engine = AsyncOmni(
                 model=cfg.model_path,
-                stage_configs_path=cfg.stage_configs_path,
+                stage_configs_path=omni_engine.render_stage_config(cfg.stage_configs_path),
                 trust_remote_code=True, **extra,
             )
 
@@ -432,7 +434,7 @@ class Code2WavComponent:
                         cfg.model_path, self._device_str())
             self.engine = AsyncOmni(
                 model=cfg.model_path,
-                stage_configs_path=cfg.stage_configs_path,
+                stage_configs_path=omni_engine.render_stage_config(cfg.stage_configs_path),
                 trust_remote_code=True, **extra,
             )
 

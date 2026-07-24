@@ -6,30 +6,48 @@ wLLM optimizes placement/replicas around it without touching model code.
 
 Command shape (from the substrate's documented inference path):
 
-    conda run -n <env> python -m worldfoundry.studio.workspace_job infer \
+    conda run -n <env> python -m <job_module> infer \
         --model-id <id> --prompt "..." --output-dir <dir> --device cuda
+
+The substrate's job module and checkpoint-dir variable are installation
+details, never hard-coded here: set them on :class:`SubstrateInstall`
+directly or via ``WLLM_SUBSTRATE_JOB_MODULE`` / ``WLLM_SUBSTRATE_CKPT_ENV``
+/ ``WLLM_SUBSTRATE_UNIFIED_ENV`` (see ``docs/ENGINES.md``).
 
 Environment resolution honors the per-model env kind recorded in the
 manifest; `unified` entries use the substrate's unified env name, which
-the caller supplies (it is installation-specific).
+is installation-specific.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ...backends.subprocess_cli.opaque import ArtifactSpec, OpaqueRunner, OpaqueSpec
 from .importer import CatalogEntry
 
 
+def _env_default(var: str, fallback: str = "") -> str:
+    return os.environ.get(var, fallback).strip()
+
+
 @dataclass
 class SubstrateInstall:
     """Where the model substrate lives on this machine."""
     repo_root: str
-    unified_env: str = "worldfoundry-unified-cu128"
+    unified_env: str = field(
+        default_factory=lambda: _env_default("WLLM_SUBSTRATE_UNIFIED_ENV",
+                                             "substrate-unified"))
     conda_exe: str = "conda"
-    ckpt_dir: str | None = None      # WORLDFOUNDRY_CKPT_DIR, if used
+    ckpt_dir: str | None = None
+    # Dotted module exposing the substrate's `infer` job CLI.
+    job_module: str = field(
+        default_factory=lambda: _env_default("WLLM_SUBSTRATE_JOB_MODULE"))
+    # Name of the env var the substrate reads for its checkpoint dir.
+    ckpt_env_var: str = field(
+        default_factory=lambda: _env_default("WLLM_SUBSTRATE_CKPT_ENV"))
 
 
 def resolve_env_name(entry: CatalogEntry, install: SubstrateInstall) -> str:
@@ -51,10 +69,15 @@ def build_infer_spec(
     timeout_s: float = 1800.0,
 ) -> OpaqueSpec:
     """One generation request as a self-contained subprocess launch."""
+    if not install.job_module:
+        raise RuntimeError(
+            "SubstrateInstall.job_module is unset. Set it (or "
+            "WLLM_SUBSTRATE_JOB_MODULE) to the substrate's job-CLI module "
+            "path; see docs/ENGINES.md.")
     env_name = resolve_env_name(entry, install)
     argv = [
         install.conda_exe, "run", "--no-capture-output", "-n", env_name,
-        "python", "-m", "worldfoundry.studio.workspace_job", "infer",
+        "python", "-m", install.job_module, "infer",
         "--model-id", entry.id,
         "--output-dir", output_dir,
         "--device", "cuda",
@@ -66,12 +89,12 @@ def build_infer_spec(
     argv += list(extra_args or [])
 
     env = {"PYTHONUNBUFFERED": "1"}
-    if install.ckpt_dir:
-        env["WORLDFOUNDRY_CKPT_DIR"] = install.ckpt_dir
+    if install.ckpt_dir and install.ckpt_env_var:
+        env[install.ckpt_env_var] = install.ckpt_dir
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     return OpaqueSpec(
-        id=f"wf:{entry.id}",
+        id=f"catalog:{entry.id}",
         argv=argv,
         env=env,
         cwd=install.repo_root,

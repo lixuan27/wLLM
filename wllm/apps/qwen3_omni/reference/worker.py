@@ -23,7 +23,9 @@ from typing import Any, Iterable, List, Optional, Tuple
 import numpy as np
 import torch
 
-from vllm_omni import AsyncOmni
+from wllm.engines import omni as omni_engine
+
+AsyncOmni = omni_engine.async_engine_cls()
 from vllm.sampling_params import SamplingParams
 
 from wllm.apps.qwen3_omni.adapter import (
@@ -552,7 +554,7 @@ class Qwen3OmniWorker:
         # token's embedding is intentionally absent -- a negligible loss
         # of one trailing slot
         remaining_start = prefill_len + 1
-        # vLLM-Omni's async Talker handoff is one token behind the
+        # the engine's async Talker handoff is one token behind the
         # Thinker stream: the final Thinker token is never used as a
         # Talker text-conditioning slot. Single-stage Thinker outputs are
         # cumulative and may already contain that final row, so cap by
