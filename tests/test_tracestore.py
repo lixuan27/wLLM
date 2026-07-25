@@ -104,9 +104,12 @@ def test_dedup_same_trace_one_line():
 
 def test_trace_id_over_identity_fields_only():
     base = _trace()
-    same = _trace(metrics={}, evidence="elsewhere",
-                  recorded="2026-07-25")
+    # metrics/evidence prose are NOT identity: same outcome, same day
+    same = _trace(metrics={}, evidence="elsewhere")
     assert same.trace_id == base.trace_id
+    # a re-measurement on a later date IS a new trace: outcome drift
+    # (e.g. a speedup that no longer reproduces) must stay visible
+    assert _trace(recorded="2026-07-26").trace_id != base.trace_id
     assert _trace(status="rejected", reason="r").trace_id \
         != base.trace_id
     assert _trace(hardware="2xH200").trace_id != base.trace_id

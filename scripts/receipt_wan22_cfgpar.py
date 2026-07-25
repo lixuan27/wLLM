@@ -70,11 +70,18 @@ def main() -> int:
         parity_pair="frames_ref1_vs_par2",
         passes=["cfg_branch_parallel"],
         authenticity={
-            "two_gpu_branch_execution": PHASE_PAR2 in ev.phases,
+            # EXECUTION markers, not phase labels: the benchmark prints
+            # its actual mode/world; a phase that ran the wrong mode
+            # must fail here (learned from funnel job 198792, where the
+            # label said par2 but the execution was ref1)
+            "two_gpu_branch_execution":
+                ev.phase_ran(PHASE_PAR2, "mode=par2 world=2"),
+            "reference_mode_verified":
+                ev.phase_ran(PHASE_REF, "mode=ref1 world=1"),
             "frame_parity_check_ran":
                 ev.parity_for("frames_ref1_vs_par2") is not None,
         }, **meta)
-    problems = par2.promote_problems("exact")
+    problems = par2.promote_problems("exact", min_speedup=1.1)
     speed = par2.speedup()
     out = par2.save(ROOT / ".wllm" / "receipts")
     print(f"receipt_wan22: par2 receipt -> {out}")

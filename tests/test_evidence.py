@@ -14,6 +14,7 @@ from wllm.control.registry import parse_capability
 LOG = """\
 Job ID: 4242
 == phase 1: E2E single-GPU reference (sequential branches + decode)
+[load] mode=ref1 world=1
 {
  "mode": "seq",
  "median_ms": 5761.647306382656,
@@ -24,6 +25,7 @@ Job ID: 4242
  "steps": 20
 }
 == phase 2: E2E single-GPU batched CFG + decode
+[load] mode=batched world=1
 {
  "median_ms": 5666.786856949329,
  "times_ms": [
@@ -32,6 +34,7 @@ Job ID: 4242
  ]
 }
 == phase 3: E2E 2-GPU CFG branch parallel + rank0 decode
+[load] mode=par2 world=2
 {
  "median_ms": 4002.3984983563423,
  "times_ms": [
@@ -115,6 +118,46 @@ def test_missing_evidence_blocks_not_defaults():
     assert "perf.p50_ms" in joined            # no measured distribution
     assert "quality verdict missing" in joined
     assert any("e2e_gate_marker_present" in p for p in problems)
+
+
+def test_execution_markers_beat_phase_labels():
+    """The funnel-job lesson: a phase label is not proof of execution.
+
+    A log whose phase-3 chunk shows the WRONG mode (label says branch
+    parallel, execution says reference) must yield phase_ran False, and
+    a receipt keyed on that marker must be refused.
+    """
+    ev = parse_phase_log(LOG)
+    assert ev.phase_ran(PHASE_PAR2, "mode=par2 world=2")
+    assert ev.phase_ran(PHASE_REF, "mode=ref1 world=1")
+    wrong = LOG.replace("[load] mode=par2 world=2",
+                        "[load] mode=ref1 world=2")
+    ev_wrong = parse_phase_log(wrong)
+    assert not ev_wrong.phase_ran(PHASE_PAR2, "mode=par2 world=2")
+    rec = build_receipt(
+        "par2", _cap(), candidate_phase=PHASE_PAR2,
+        baseline_phase=PHASE_REF, evidence=ev_wrong, log_text=wrong,
+        parity_pair="frames_ref1_vs_par2", passes=["cfg_branch_parallel"],
+        authenticity={"two_gpu_branch_execution":
+                      ev_wrong.phase_ran(PHASE_PAR2, "mode=par2 world=2")})
+    problems = rec.promote_problems("exact")
+    assert any("two_gpu_branch_execution" in p for p in problems)
+
+
+def test_min_speedup_blocks_no_gain_plans():
+    ev = parse_phase_log(LOG)
+    rec = build_receipt(
+        "par2", _cap(), candidate_phase=PHASE_PAR2, baseline_phase=PHASE_REF,
+        evidence=ev, log_text=LOG, parity_pair="frames_ref1_vs_par2",
+        passes=["cfg_branch_parallel"], authenticity={"ran": True})
+    assert rec.promote_problems("exact", min_speedup=1.1) == []   # 1.44x
+    no_gain = build_receipt(
+        "batched-as-candidate", _cap(), candidate_phase=PHASE_BATCHED,
+        baseline_phase=PHASE_REF, evidence=ev, log_text=LOG,
+        parity_pair="frames_ref1_vs_par2",   # borrow the exact verdict
+        passes=["x"], authenticity={"ran": True})
+    problems = no_gain.promote_problems("exact", min_speedup=1.1)
+    assert any("no effective optimization" in p for p in problems)
 
 
 def test_forbidden_log_pattern_invalidates():

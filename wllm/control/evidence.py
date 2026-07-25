@@ -29,8 +29,15 @@ _PARITY_RE = re.compile(r'^\{"pair".*\}$', re.MULTILINE)
 class PhaseLogEvidence:
     phases: dict[str, float] = field(default_factory=dict)  # name -> median_ms
     times_ms: dict[str, list[float]] = field(default_factory=dict)
+    # raw text of each phase's log chunk: authenticity checks must grep
+    # EXECUTION markers here (what actually ran), never trust the label
+    phase_text: dict[str, str] = field(default_factory=dict)
     parity: list[dict] = field(default_factory=list)
     gate_markers: list[str] = field(default_factory=list)
+
+    def phase_ran(self, name: str, execution_marker: str) -> bool:
+        """True only if the phase's own output contains the marker."""
+        return execution_marker in self.phase_text.get(name, "")
 
     def parity_for(self, pair: str) -> dict | None:
         for rec in self.parity:
@@ -48,6 +55,7 @@ def parse_phase_log(text: str,
     for i, (start, name) in enumerate(marks):
         end = marks[i + 1][0] if i + 1 < len(marks) else len(text)
         chunk = text[start:end]
+        ev.phase_text[name] = chunk
         med = _MEDIAN_RE.search(chunk)
         if med:
             ev.phases[name] = float(med.group(1))

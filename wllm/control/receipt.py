@@ -55,9 +55,25 @@ class Receipt:
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
     # ------------------------------------------------------------- promote
-    def promote_problems(self, quality_policy: str = "exact") -> list[str]:
-        """Empty list == this receipt may be applied. Fail closed otherwise."""
+    def promote_problems(self, quality_policy: str = "exact",
+                         min_speedup: float | None = None) -> list[str]:
+        """Empty list == this receipt may be applied. Fail closed otherwise.
+
+        ``min_speedup`` enforces the honest-outcome promise: when the
+        measured improvement is below it, the verdict is "no effective
+        optimization", never a promoted no-gain plan.
+        """
         errs: list[str] = []
+        if min_speedup is not None:
+            speed = self.speedup()
+            if speed is None:
+                errs.append("min_speedup demanded but baseline/candidate "
+                            "p50 measurements are incomplete")
+            elif speed < min_speedup:
+                errs.append(
+                    f"no effective optimization: measured speedup "
+                    f"{speed:.3f}x is below the {min_speedup:.2f}x "
+                    f"threshold — report honestly instead of promoting")
         for k in REQUIRED_PERF_KEYS:
             v = self.perf.get(k)
             if not isinstance(v, (int, float)) or v <= 0:

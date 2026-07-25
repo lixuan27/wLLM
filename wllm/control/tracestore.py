@@ -30,8 +30,11 @@ from pathlib import Path
 
 STATUSES = ("accepted", "rejected", "failed")
 _NEEDS_REASON = ("rejected", "failed")
+# "recorded" is part of identity: a re-measurement on a later date is a
+# NEW trace (drift stays visible in history), while re-running the same
+# seed with its fixed date stays idempotent.
 ID_FIELDS = ("model", "hardware", "runtime", "workload", "candidate",
-             "status")
+             "status", "recorded")
 
 
 @dataclass
@@ -54,11 +57,13 @@ class Trace:
     def trace_id(self) -> str:
         """Content id over identity fields (not metrics/evidence).
 
-        Two records of the same outcome for the same config dedup even
-        if their prose or metric detail differs; any changed knob,
-        model, hardware, runtime, workload, or status is a new trace.
-        Candidate key order is normalized (sort_keys), so reordered
-        knob dicts hash identically.
+        Same outcome, same config, same recorded date dedups even if
+        prose or metric detail differs — seeding stays idempotent. A
+        changed knob, model, hardware, runtime, workload, status, or a
+        LATER recorded date is a new trace: re-measurements append, so
+        outcome drift (a speedup that stops reproducing) stays visible
+        in history instead of being swallowed by dedup. Candidate key
+        order is normalized (sort_keys).
         """
         basis = {k: getattr(self, k) for k in ID_FIELDS}
         blob = json.dumps(basis, sort_keys=True, default=str)
