@@ -120,6 +120,35 @@ def cmd_rollback(args) -> int:
     return 0
 
 
+def cmd_select(args) -> int:
+    from .slo import CandidateMetrics, SLOSpec, choose
+    slo = SLOSpec.load(args.slo) if args.slo else SLOSpec()
+    docs = json.loads(Path(args.metrics).read_text())
+    if not isinstance(docs, list):
+        print("SELECT ERROR: metrics file must be a JSON list",
+              file=sys.stderr)
+        return 2
+    cands = [CandidateMetrics(**d) for d in docs]
+    try:
+        sel = choose(slo, cands)
+    except ValueError as exc:
+        print(f"SELECT ERROR: {exc}", file=sys.stderr)
+        return 2
+    for label, name in sel.profiles.items():
+        print(f"profile {label}: {name}")
+    for name, why in sel.rejected.items():
+        print(f"reject {name}: {why[0]}")
+    for name, score in sorted(sel.scores.items(), key=lambda kv: kv[1]):
+        print(f"score {name}: {score}")
+    for note in sel.notes:
+        print(f"note: {note}")
+    if sel.chosen is None:
+        print("no admissible candidate under the SLO hard constraints")
+        return 4
+    print(f"chosen: {sel.chosen}")
+    return 0
+
+
 def cmd_report(args) -> int:
     mgr = DeployManager(_workdir(args.root))
     st = mgr.state()
@@ -167,6 +196,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("rollback", help="walk the fallback chain")
     p.add_argument("root", nargs="?", default=".")
     p.set_defaults(fn=cmd_rollback)
+
+    p = sub.add_parser("select", help="SLO-driven choice among measured "
+                                      "candidates")
+    p.add_argument("--metrics", required=True,
+                   help="JSON list of candidate metric dicts")
+    p.add_argument("--slo", default="", help="SLO YAML (hard constraints, "
+                                             "preferences, lifecycle)")
+    p.set_defaults(fn=cmd_select)
 
     p = sub.add_parser("report", help="deploy state + active receipt")
     p.add_argument("root", nargs="?", default=".")

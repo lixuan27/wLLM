@@ -190,8 +190,18 @@ BDD 增技术编排 3 场景；mutation 目标扩至 7 文件。**多 agent 分�
 不靠假设；超可加漂移/变慢/预算违约=interference 且带理由；工厂纯度机制杜绝跨 repeats 状态泄漏。
 ④ **计划下沉**（`wllm/composite/lowering.py`，agent 实现）：DeploymentPlan → 组件 placement，fail-closed
 （未知 node/未分配/双分配/pin 违约/cpu 域错置/parallel_degree>1 诚实拒绝/硬件越界），require() 单一执行闸。
-**M19+**：wllm.omni 注册真实模型 runner（qwen3_omni app 于自研引擎端到端）；composite 承接实测 plan 重放；
-Claude Code plugin 打包（MCP 已就绪）；24h soak + 故障注入（Beta 收口）。
+**M19（本轮，新总文档 goal_wLLM_724d 三大新模块落地；多 agent 分工，1 agent 中途额度中止由协调者接管）**：
+① **SLO 编译器**（`wllm/control/slo.py` + `wllm select`）：硬约束（未测量=违约）/ 生命周期启动摊销
+（C_lifecycle/N——compile 类候选随副本寿命翻转胜负，测试钉住）/ 软偏好权重（必须和为 1）/ Pareto 五档标签 + 加权默认选择。
+② **证据驱动 Profile Pack**（`wllm/profiles/`）：ModelProfile 契约（closed vocab + measured 级声明必须带证据指针 +
+last_validated 过期机制 fail-closed）；首批 3 个 profile 全部 measured 级、逐字段可溯源（wan2.2-ti2v/qwen3-vl/openvla）。
+③ **Optimization Trace 库**（`wllm/control/tracestore.py`，agent 实现）：append-only JSONL，成败皆入库、
+rejected/failed 必须带理由；trace_id 内容寻址去重；known_bad 让 planner 带因跳过已死配置；损坏行计数不崩溃；
+6 条真实 seed（1.44×/2.75×/4.59× 三 accept + compile 漂移/批内 CFG/cudagraph 重录三 reject）全部逐字取自报告。
+④ **Agent 角色契约**（`docs/AGENT_WORKFLOW.md`）：角色×可触目录×成功判据×禁区表 + 交互协议 +
+"受约束工作流让小模型 agent 可用"的度量维度——产品运行时与开发流程同一边界。
+**M20+**：wllm.omni 注册真实模型 runner（qwen3_omni app 端到端）；planner 消费 profile/trace/SLO 三源剪枝；
+Claude Code plugin 打包；24h soak + 故障注入（Beta 收口）。
 **1.0（9–12 周）**：Feedback/MultiAgent region、WAM deadline scheduler、approximate（FP8/NVFP4/KV 量化）、
 可选 L3 native 后端、在线 plan 路由、双硬件家族。
 

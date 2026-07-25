@@ -1,0 +1,31 @@
+# Qwen3-VL 8B — grounded in docs/BETA_REPORT.md measurements only.
+model_family: qwen3-vl
+detection_ids:
+  - Qwen/Qwen3-VL-8B-Instruct
+  - "Qwen/Qwen3-VL-8B*"
+components: [vision_encoder, language_model]
+runtime_support:
+  - runtime: wllm-serving
+    tier: optimized
+    evidence:
+      - {kind: report, ref: "docs/BETA_REPORT.md",
+         note: "static KV cache 2.75x (2668 ms -> /128 tok baseline)"}
+optimizations_lossless:
+  - name: static_kv_cache
+    quality_class: exact
+    evidence:
+      - {kind: report, ref: "docs/BETA_REPORT.md",
+         note: "tie-aware exact: the single greedy flip sits at a top-2
+                logit gap of exactly 0.0 (arbitration, not divergence)"}
+    notes: "cross-numerics token gates must be tie-aware (verifier law 2)"
+incompatibilities: []
+authenticity_signals:
+  - kv_cache_active
+validation:
+  - token_parity_tie_aware
+binding:
+  backend_version: "0.0.1a0"
+  hardware: 1xH200
+  cuda: ""
+  last_validated: "2026-07-24"
+  evidence_level: measured

@@ -1,0 +1,31 @@
+# OpenVLA 7B — grounded in docs/BETA_REPORT.md measurements only.
+model_family: openvla
+detection_ids:
+  - openvla/openvla-7b
+  - "openvla/openvla*"
+components: [vision_encoder, language_model, action_decoder]
+runtime_support:
+  - runtime: wllm-native
+    tier: optimized
+    evidence:
+      - {kind: report, ref: "docs/BETA_REPORT.md",
+         note: "native bf16 4.59x vs naive fp32 (133 ms/action baseline)"}
+optimizations_lossless:
+  - name: native_bf16
+    quality_class: exact
+    evidence:
+      - {kind: report, ref: "docs/BETA_REPORT.md",
+         note: "the checkpoint declares bf16; the fp32 upcast was the
+                variant, not the oracle (verifier law 3)"}
+    notes: "restoring declared precision is a correction, not a lossy pass"
+incompatibilities: []
+authenticity_signals:
+  - native_precision_loaded
+validation:
+  - action_parity
+binding:
+  backend_version: "0.0.1a0"
+  hardware: 1xH200
+  cuda: ""
+  last_validated: "2026-07-24"
+  evidence_level: measured

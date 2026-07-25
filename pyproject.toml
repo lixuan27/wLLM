@@ -26,13 +26,14 @@ dev = ["pytest", "coverage"]
 include = ["wllm*"]
 
 [tool.setuptools.package-data]
-wllm = ["control/registry_data/*.yaml"]
+wllm = ["control/registry_data/*.yaml", "profiles/data/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.coverage.run]
-source = ["wllm/control", "wllm/composite", "wllm/techniques", "wllm/omni"]
+source = ["wllm/control", "wllm/composite", "wllm/techniques", "wllm/omni",
+          "wllm/profiles"]
 
 [tool.coverage.report]
 show_missing = true

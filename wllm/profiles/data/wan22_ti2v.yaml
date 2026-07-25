@@ -1,0 +1,49 @@
+# Wan2.2 TI2V 5B — every claim traces to docs/BETA_REPORT.md or the
+# job logs it names. No field here is aspirational.
+model_family: wan2.2-ti2v
+detection_ids:
+  - Wan-AI/Wan2.2-TI2V-5B
+  - "Wan-AI/Wan2.2-TI2V*"
+components: [text_encoder, dit, vae]
+runtime_support:
+  - runtime: wllm-serving
+    tier: optimized
+    evidence:
+      - {kind: job_log, ref: "job 196293",
+         note: "2-GPU CFG branch parallel, 1.44x E2E, frame bit-exact"}
+      - {kind: receipt, ref: ".wllm/receipts/wan22-cfg-branch-parallel-2gpu.json",
+         note: "promotable receipt built from the same job"}
+  - runtime: torch-local
+    tier: parity-verified
+    evidence:
+      - {kind: job_log, ref: "job 196293",
+         note: "sequential reference phase is the parity oracle"}
+optimizations_lossless:
+  - name: cfg_branch_parallel
+    quality_class: exact
+    evidence:
+      - {kind: job_log, ref: "job 196293",
+         note: "one CFG branch per GPU: frames max_abs 0 vs reference"}
+    notes: "1.44x E2E on 2xH200; no cross-rank reductions"
+optimizations_bounded:
+  - name: torch_compile_max_autotune
+    quality_class: bounded
+    evidence:
+      - {kind: report, ref: "docs/BETA_REPORT.md",
+         note: "1.43x single-GPU but frame drift mean 7.4/255; refused by
+                the exact gate — that refusal IS the bounded evidence"}
+    notes: "bf16 fusion reordering drifts diffusion trajectories"
+incompatibilities:
+  - "cfg_batched + exact_policy"
+authenticity_signals:
+  - two_gpu_branch_execution
+  - frame_parity_check_ran
+validation:
+  - frame_bitexact
+  - e2e_latency
+binding:
+  backend_version: "0.0.1a0"
+  hardware: 2xH200
+  cuda: ""
+  last_validated: "2026-07-25"
+  evidence_level: measured
