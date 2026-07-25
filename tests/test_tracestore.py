@@ -164,7 +164,7 @@ def test_known_bad_hit_and_miss():
         hit = st.known_bad("org/model-a", "1xH200",
                            {"gpus": 1, "pass": "cfg_batched"})
         assert hit is not None and hit.reason == "not bit-exact"
-        # any key change is a miss (exact-key semantics)
+        # changed model/hardware or conflicting values are misses
         assert st.known_bad("org/model-a", "2xH200", cand) is None
         assert st.known_bad("org/other", "1xH200", cand) is None
         assert st.known_bad("org/model-a", "1xH200",
@@ -172,6 +172,29 @@ def test_known_bad_hit_and_miss():
         # an accepted config is never "known bad"
         ok_cand = {"pass": "static_kv_cache", "gpus": 1}
         assert st.known_bad("org/model-a", "1xH200", ok_cand) is None
+
+
+def test_known_bad_subset_matching_and_rehabilitation():
+    with tempfile.TemporaryDirectory() as td:
+        st = TraceStore(Path(td) / "t.jsonl")
+        # richer recorded config: probe with fewer keys must still hit
+        st.append(_trace(status="rejected", reason="trajectory drift",
+                         candidate={"pass": "compile", "gpus": 1,
+                                    "mode": "max-autotune"}))
+        hit = st.known_bad("org/model-a", "1xH200",
+                           {"pass": "compile", "gpus": 1})
+        assert hit is not None and "drift" in hit.reason
+        # a probe key ABSENT from the trace is a miss, not a wildcard
+        assert st.known_bad("org/model-a", "1xH200",
+                            {"pass": "compile", "gpus": 1,
+                             "precision": "fp8"}) is None
+        # rehabilitation: a later accepted re-measurement clears the flag
+        st.append(_trace(status="accepted",
+                         reason="re-measured after driver fix",
+                         candidate={"pass": "compile", "gpus": 1,
+                                    "mode": "max-autotune"}))
+        assert st.known_bad("org/model-a", "1xH200",
+                            {"pass": "compile", "gpus": 1}) is None
 
 
 # --------------------------------------------------------- corrupt lines

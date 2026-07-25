@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "wllm": {
+      "command": "wllm-mcp"
+    }
+  }
+}

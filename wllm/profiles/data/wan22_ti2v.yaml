@@ -33,8 +33,10 @@ optimizations_bounded:
          note: "1.43x single-GPU but frame drift mean 7.4/255; refused by
                 the exact gate — that refusal IS the bounded evidence"}
     notes: "bf16 fusion reordering drifts diffusion trajectories"
-incompatibilities:
-  - "cfg_batched + exact_policy"
+# The batched-CFG divergence (max_abs 251/255) is recorded where it is
+# enforceable: as a rejected optimization trace (see the trace seeds)
+# and by cfg_batched's absence from the runtime's pass registry.
+incompatibilities: []
 authenticity_signals:
   - two_gpu_branch_execution
   - frame_parity_check_ran

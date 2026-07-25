@@ -119,6 +119,35 @@ def test_choose_hard_constraints_and_missing_metrics():
     assert empty.chosen is None and empty.rejected and empty.notes
 
 
+def test_hiding_startup_never_helps():
+    """A candidate that omits startup_s is scored worst-case on latency."""
+    honest = CandidateMetrics("honest", p50_ms=100, startup_s=120)
+    hider = CandidateMetrics("hider", p50_ms=90)      # no startup reported
+    sel = choose(_slo(preferences={"latency": 1.0},
+                      lifecycle={"expected_requests_per_replica": 1000}),
+                 [honest, hider])
+    assert sel.chosen == "honest"
+    assert any("hider" in n and "latency" in n for n in sel.notes)
+
+
+def test_duplicate_names_and_inert_weight():
+    try:
+        choose(_slo(preferences={"latency": 1.0}),
+               [CandidateMetrics("x", p50_ms=1, startup_s=0),
+                CandidateMetrics("x", p50_ms=2, startup_s=0)])
+    except ValueError as exc:
+        assert "duplicate candidate names" in str(exc)
+    else:
+        raise AssertionError("duplicate names must be rejected")
+    sel = choose(_slo(preferences={"latency": 0.5, "cost": 0.5}),
+                 [CandidateMetrics("a", p50_ms=100, startup_s=1),
+                  CandidateMetrics("b", p50_ms=200, startup_s=1)])
+    assert sel.chosen == "a"
+    assert any("'cost'" in n and "inert" in n for n in sel.notes)
+    # zero quality budget is a legitimate hard constraint
+    assert _slo(hard_constraints={"quality_drop_max": 0}).validate() == []
+
+
 def test_choose_guards():
     try:
         choose(_slo(preferences={"latency": 0.5}), [])

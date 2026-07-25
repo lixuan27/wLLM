@@ -49,7 +49,9 @@ def test_real_pack_loads_and_matches():
     wan = profiles["wan2.2-ti2v"]
     for entry in wan.optimizations_lossless + wan.optimizations_bounded:
         assert entry.evidence, entry.name
-    assert "cfg_batched + exact_policy" in wan.incompatibilities
+    # the batched-CFG danger lives in the trace store, not as a
+    # pseudo-incompatibility that no pass name could ever trigger
+    assert wan.incompatibilities == []
 
 
 def test_real_pack_freshness_and_expiry():

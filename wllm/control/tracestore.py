@@ -135,6 +135,11 @@ class TraceStore:
             except (json.JSONDecodeError, TypeError):
                 self.corrupt_lines += 1
                 continue
+            if trace.validate():
+                # schema-shaped but semantically invalid (bad status,
+                # missing reason, ...): counted, never served to queries
+                self.corrupt_lines += 1
+                continue
             self._traces.append(trace)
             self._ids.add(trace.trace_id)
 
@@ -149,9 +154,12 @@ class TraceStore:
         if tid in self._ids:
             self.deduped += 1
             return tid
+        # defensive copy: the caller keeps its object; later mutation of
+        # the caller's dicts must not desynchronize memory, ids, and disk
+        stored = Trace.from_dict(trace.to_dict())
         with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(trace.to_dict(), sort_keys=True) + "\n")
-        self._traces.append(trace)
+            fh.write(json.dumps(stored.to_dict(), sort_keys=True) + "\n")
+        self._traces.append(stored)
         self._ids.add(tid)
         return tid
 
@@ -193,18 +201,26 @@ class TraceStore:
 
     def known_bad(self, model: str, hardware: str,
                   candidate: dict) -> Trace | None:
-        """Latest rejected/failed trace for exactly this config.
+        """Latest matching trace, returned only if it is bad.
 
-        Exact-key lookup: same model + hardware + candidate dict
-        (order-insensitive dict equality). A hit lets a planner skip a
-        known-dead configuration and surface its recorded reason;
-        ``None`` means the config has no recorded failure here.
+        Matching is *subset* semantics: every key in ``candidate`` must
+        be present in the trace's candidate with an equal value; the
+        trace may carry extra detail keys (e.g. a compile mode). This
+        is what lets a planner probe with ``{"pass": ..., "gpus": ...}``
+        and still hit richer recorded configs.
+
+        Rehabilitation: the LATEST matching trace (append order) wins —
+        if a config was rejected once and later re-measured as
+        accepted, this returns ``None``; a rejection is evidence, not a
+        life sentence.
         """
         for t in reversed(self._traces):
-            if (t.status in _NEEDS_REASON and t.model == model
-                    and t.hardware == hardware
-                    and t.candidate == candidate):
-                return t
+            if t.model != model or t.hardware != hardware:
+                continue
+            if not isinstance(t.candidate, dict):
+                continue
+            if all(t.candidate.get(k) == v for k, v in candidate.items()):
+                return t if t.status in _NEEDS_REASON else None
         return None
 
 

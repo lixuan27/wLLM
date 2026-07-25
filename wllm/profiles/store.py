@@ -18,9 +18,18 @@ def load_profiles(directory: str | Path = DATA_DIR
     Aggregates problems per file so a broken pack reports everything at
     once instead of failing one field at a time.
     """
+    root = Path(directory)
+    if not root.is_dir():
+        raise ValueError(f"profile pack directory missing: {root} — a "
+                         f"silently empty pack would erase one knowledge "
+                         f"source without warning")
+    files = sorted(root.glob("*.yaml"))
+    if not files:
+        raise ValueError(f"profile pack directory {root} contains no "
+                         f"profile YAMLs; refusing to load an empty pack")
     profiles: dict[str, ModelProfile] = {}
     problems: list[str] = []
-    for f in sorted(Path(directory).glob("*.yaml")):
+    for f in files:
         doc = yaml.safe_load(f.read_text()) or {}
         if not isinstance(doc, dict):
             problems.append(f"{f.name}: profile root is not a mapping")

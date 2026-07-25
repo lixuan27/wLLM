@@ -120,24 +120,81 @@ def cmd_rollback(args) -> int:
     return 0
 
 
+def cmd_candidates(args) -> int:
+    from .candidates import plan_candidates
+    from .slo import SLOSpec
+    from .tracestore import TraceStore
+    from ..profiles import load_profiles
+    context = {"num_gpus": args.num_gpus}
+    if args.context:
+        try:
+            context.update(json.loads(args.context))
+        except json.JSONDecodeError as exc:
+            print(f"CANDIDATES ERROR: bad --context JSON: {exc}",
+                  file=sys.stderr)
+            return 2
+    try:
+        profiles = load_profiles()
+    except ValueError as exc:
+        print(f"PROFILE PACK ERROR: {exc}", file=sys.stderr)
+        return 2
+    store = None
+    if args.traces:
+        if not Path(args.traces).is_file():
+            print(f"CANDIDATES ERROR: trace store {args.traces} does not "
+                  f"exist; refusing to plan with silently-zero history",
+                  file=sys.stderr)
+            return 2
+        store = TraceStore(args.traces)
+        if store.corrupt_lines:
+            print(f"warning: trace store skipped {store.corrupt_lines} "
+                  f"corrupt/invalid line(s)")
+    try:
+        slo = SLOSpec.load(args.slo) if args.slo else None
+        rep = plan_candidates(
+            args.model, hardware=args.hardware, context=context,
+            quality_policy=args.quality_policy, registry=default_registry(),
+            profiles=profiles, trace_store=store, slo=slo,
+            today=args.today or None)
+    except (ValueError, TypeError) as exc:
+        print(f"CANDIDATES ERROR: {exc}", file=sys.stderr)
+        return 2
+    for c in rep.candidates:
+        print(f"candidate {c.backend} [{c.support}]: "
+              f"{', '.join(c.passes) or '(none)'}")
+        for line in c.provenance:
+            print(f"    - {line}")
+    for key, why in rep.rejected.items():
+        print(f"reject {key}: {why}")
+    for gate in rep.pending_gates:
+        print(f"pending gate (post-measurement): {gate}")
+    for note in rep.notes:
+        print(f"note: {note}")
+    out = (_workdir(args.root) / "plans" /
+           f"candidates-{args.model.replace('/', '_')}.json")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(rep.to_dict(), indent=1))
+    print(f"plan -> {out}")
+    return 3 if rep.mode == "diagnose-only" else 0
+
+
 def cmd_select(args) -> int:
     from .slo import CandidateMetrics, SLOSpec, choose
-    slo = SLOSpec.load(args.slo) if args.slo else SLOSpec()
-    docs = json.loads(Path(args.metrics).read_text())
-    if not isinstance(docs, list):
-        print("SELECT ERROR: metrics file must be a JSON list",
-              file=sys.stderr)
-        return 2
-    cands = [CandidateMetrics(**d) for d in docs]
     try:
+        slo = SLOSpec.load(args.slo) if args.slo else SLOSpec()
+        docs = json.loads(Path(args.metrics).read_text())
+        if not isinstance(docs, list):
+            raise ValueError("metrics file must be a JSON list")
+        cands = [CandidateMetrics(**d) for d in docs]
         sel = choose(slo, cands)
-    except ValueError as exc:
+    except (ValueError, TypeError, OSError,
+            json.JSONDecodeError) as exc:
         print(f"SELECT ERROR: {exc}", file=sys.stderr)
         return 2
     for label, name in sel.profiles.items():
         print(f"profile {label}: {name}")
     for name, why in sel.rejected.items():
-        print(f"reject {name}: {why[0]}")
+        print(f"reject {name}: {'; '.join(why)}")
     for name, score in sorted(sel.scores.items(), key=lambda kv: kv[1]):
         print(f"score {name}: {score}")
     for note in sel.notes:
@@ -196,6 +253,19 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("rollback", help="walk the fallback chain")
     p.add_argument("root", nargs="?", default=".")
     p.set_defaults(fn=cmd_rollback)
+
+    p = sub.add_parser("candidates", help="three-source candidate plan "
+                                          "(registry x profile x traces)")
+    p.add_argument("root", nargs="?", default=".")
+    p.add_argument("--model", required=True)
+    p.add_argument("--hardware", default="1xGPU")
+    p.add_argument("--num-gpus", type=int, default=1)
+    p.add_argument("--quality-policy", default="exact")
+    p.add_argument("--context", default="", help="extra JSON context facts")
+    p.add_argument("--traces", default="", help="trace-store JSONL path")
+    p.add_argument("--slo", default="", help="SLO YAML")
+    p.add_argument("--today", default="", help="YYYY-MM-DD for staleness")
+    p.set_defaults(fn=cmd_candidates)
 
     p = sub.add_parser("select", help="SLO-driven choice among measured "
                                       "candidates")

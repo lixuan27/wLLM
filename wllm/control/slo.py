@@ -63,6 +63,11 @@ class SLOSpec:
             elif k == "api_compatibility":
                 if v not in ("strict", "relaxed"):
                     errs.append("api_compatibility must be strict|relaxed")
+            elif k == "quality_drop_max":
+                # zero is a legitimate demand: no quality loss at all
+                if not isinstance(v, (int, float)) or v < 0:
+                    errs.append(f"hard constraint {k} must be >= 0, "
+                                f"got {v!r}")
             elif not isinstance(v, (int, float)) or v <= 0:
                 errs.append(f"hard constraint {k} must be positive, got {v!r}")
         for k, v in self.preferences.items():
@@ -161,7 +166,12 @@ def admit(slo: SLOSpec, m: CandidateMetrics) -> list[str]:
 
 
 def pareto_profiles(cands: list[CandidateMetrics]) -> dict[str, str]:
-    """Label the classic profiles; only labels whose metric exists."""
+    """Label the classic profiles; only labels whose metric exists.
+
+    ``lowest_latency`` is steady-state p50 by design — deliberately a
+    different lens from ``choose()``'s lifecycle-amortized latency
+    column, so the two may legitimately name different candidates.
+    """
     out: dict[str, str] = {}
 
     def best(label, key, reverse=False, pool=None):
@@ -183,8 +193,10 @@ def pareto_profiles(cands: list[CandidateMetrics]) -> dict[str, str]:
 # preference key -> (metric getter, lower_is_better)
 def _pref_value(slo: SLOSpec, c: CandidateMetrics, key: str):
     if key == "latency":
-        amort = c.amortized_ms(slo.lifecycle)
-        return amort if amort is not None else c.p50_ms
+        # one column, one meaning: lifecycle-amortized latency. A
+        # candidate that does not report startup_s gets None here and
+        # is scored worst-case — hiding startup must never help.
+        return c.amortized_ms(slo.lifecycle)
     if key == "throughput":
         return c.throughput_rps
     if key == "cost":
@@ -219,6 +231,11 @@ def choose(slo: SLOSpec, cands: list[CandidateMetrics]) -> Selection:
         raise ValueError(f"invalid SLO: {errs}")
     if not cands:
         raise ValueError("no candidates to select from")
+    names = [c.name for c in cands]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise ValueError(f"duplicate candidate names {dupes}; scores and "
+                         f"rejections would silently overwrite each other")
     rejected = {c.name: v for c in cands if (v := admit(slo, c))}
     admitted = [c for c in cands if c.name not in rejected]
     profiles = pareto_profiles(admitted)
@@ -231,13 +248,18 @@ def choose(slo: SLOSpec, cands: list[CandidateMetrics]) -> Selection:
     values: dict[str, dict[str, float | None]] = {
         key: {c.name: _pref_value(slo, c, key) for c in admitted}
         for key in prefs}
+    for key in prefs:
+        if not any(v is not None for v in values[key].values()):
+            sel.notes.append(
+                f"preference {key!r} carries weight but no candidate "
+                f"measured it; the weight is inert")
     for c in admitted:
         score = 0.0
         for key, weight in prefs.items():
             col = [v for v in values[key].values() if v is not None]
             v = values[key][c.name]
             if not col:
-                continue       # nobody measured it; weight is inert
+                continue       # nobody measured it (noted above)
             lo, hi = min(col), max(col)
             if v is None:
                 norm = 1.0

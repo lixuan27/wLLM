@@ -1,0 +1,8 @@
+{
+  "name": "wllm",
+  "version": "0.0.1a0",
+  "description": "Agent-operable deployment optimizer for world & multimodal models: one sentence in, receipts out.",
+  "author": {
+    "name": "wLLM contributors"
+  }
+}
