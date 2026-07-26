@@ -90,11 +90,17 @@ def main() -> int:
             fwd["attention_mask"] = torch.ones_like(ids)
         with torch.inference_mode():
             logits = model(**fwd).logits[0, -1].float()
-        top2 = torch.topk(logits, 2)
-        gap = float(top2.values[0] - top2.values[1])
-        pair = set(top2.indices.tolist())
-        return ({ref[pos], got[pos]} == pair and gap <= TIE_GAP_EPS,
-                gap, sorted(pair))
+        # epsilon-optimal-set criterion: knife edges can be degenerate
+        # beyond two tokens (observed live: a three-way tie resolved
+        # differently by dynamic-cache, static-cache, and teacher-forced
+        # paths), so the flip is arbitration iff BOTH disputed tokens
+        # sit within epsilon of the maximum logit
+        mx = float(logits.max())
+        gap_ref = mx - float(logits[ref[pos]])
+        gap_got = mx - float(logits[got[pos]])
+        gap = max(gap_ref, gap_got)
+        return (gap <= TIE_GAP_EPS, gap,
+                {"ref_gap": round(gap_ref, 6), "got_gap": round(gap_got, 6)})
 
     def apply(plan_id: str):
         if plan_id == "ar_base":

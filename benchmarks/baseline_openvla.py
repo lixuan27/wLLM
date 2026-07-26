@@ -45,8 +45,11 @@ def main() -> int:
         kwargs["attn_implementation"] = attn_impl or "eager"
         processor = AutoProcessor.from_pretrained(MODEL_DIR,
                                                   trust_remote_code=True)
-        model = AutoModelForVision2Seq.from_pretrained(MODEL_DIR,
-                                                       **kwargs).to("cuda")
+        # uniform dtype is enforced explicitly: the staged remote code
+        # leaves some submodules at their stored precision regardless of
+        # torch_dtype, which mixes fp32 activations into bf16 linears
+        model = AutoModelForVision2Seq.from_pretrained(
+            MODEL_DIR, **kwargs).to(device="cuda", dtype=dtype)
         model.eval()
         if compile_lm:
             model.language_model.compile(mode="reduce-overhead")
@@ -89,11 +92,18 @@ def main() -> int:
 
         if "ref" not in ref_actions:
             ref_actions["ref"] = act
-            ok, err = True, ""
+            ok, err = True, "reference anchor (checkpoint-declared bf16)"
         else:
             mse = float(np.mean((act - ref_actions["ref"]) ** 2))
-            ok = mse < 1e-4
-            err = "" if ok else f"action MSE {mse:.3e} vs fp32 reference"
+            if dtype == torch.bfloat16:
+                ok = mse < 1e-4
+                err = "" if ok else f"action MSE {mse:.3e} vs bf16 reference"
+            else:
+                # verifier law 3: the checkpoint declares bf16, so the
+                # fp32 upcast is the VARIANT; its distance to the bf16
+                # oracle is informational, never gating
+                ok = True
+                err = f"informational: MSE {mse:.3e} vs bf16 oracle"
         results.append({"plan": plan_id, "median_ms": med, "p95_ms": p95,
                         "ok": ok, "err": err, "load_s": load_s,
                         "action": act.tolist()})
@@ -102,14 +112,30 @@ def main() -> int:
         del model
         torch.cuda.empty_cache()
 
-    # baseline exactly as the checkpoint era intends: fp32? community
-    # default is bf16; we anchor at fp32 for a strict reference, then bf16.
-    sweep("fp32_eager", torch.float32, None, False)
-    sweep("bf16_eager", torch.bfloat16, None, False)
-    sweep("bf16_sdpa", torch.bfloat16, "sdpa", False)
+    # verifier law 3: the checkpoint-declared precision (bf16) is the
+    # reference; the naive fp32 load is the user-default baseline for
+    # speedup accounting only. One crashed leg must not abort the sweep.
+    for leg in (("bf16_eager", torch.bfloat16, None, False),
+                ("fp32_eager", torch.float32, None, False),
+                ("bf16_sdpa", torch.bfloat16, "sdpa", False)):
+        try:
+            sweep(*leg)
+        except Exception as exc:  # noqa: BLE001 — recorded, not hidden
+            results.append({"plan": leg[0], "median_ms": None,
+                            "p95_ms": None, "ok": False,
+                            "err": (f"leg crashed: {type(exc).__name__}: "
+                                    f"{exc}")[:200],
+                            "load_s": None, "action": []})
+            print(f"[{leg[0]}] CRASHED: {type(exc).__name__}: {exc}",
+                  flush=True)
 
-    base = results[0]["median_ms"]
-    valid = [r for r in results if r["ok"]] or results[:1]
+    fp32_rows = [r for r in results
+                 if r["plan"] == "fp32_eager" and r["median_ms"]]
+    if not fp32_rows:
+        print("OPENVLA_FAIL: no usable fp32 baseline row", flush=True)
+        return 1
+    base = fp32_rows[0]["median_ms"]
+    valid = [r for r in results if r["ok"] and r["median_ms"]]
     best = min(valid, key=lambda r: r["median_ms"])
     summary = {"model": "openvla-7b", "reps": REPS, "base_ms": base,
                "best_plan": best["plan"], "best_ms": best["median_ms"],

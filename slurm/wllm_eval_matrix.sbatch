@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=wllm_eval_matrix_r5
+#SBATCH --job-name=wllm_eval_matrix_r7
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
