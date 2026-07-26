@@ -1,0 +1,32 @@
+# Cosmos3-Nano — grounded in the onboarding smoke (job 200596) only.
+# No optimization is claimed yet; this profile records what actually ran.
+model_family: cosmos3-nano
+detection_ids:
+  - nvidia/Cosmos3-Nano
+  - "nvidia/Cosmos3-Nano*"
+components: [reasoner, generator, vae, sound_decoder, action_head]
+runtime_support:
+  - runtime: torch-local
+    tier: launchable
+    evidence:
+      - {kind: job_log, ref: "job 200596",
+         note: "fixed-seed T2I smoke: load 21.7s, median 48.8s at 20
+                steps 480x832, peak VRAM 35.5GB; full call signature
+                introspected (video/sound/action knobs). BLOCKER on
+                record: official safety-checker weights are gated
+                pending account license approval; smoke used the
+                pipeline's official opt-out knob, loudly logged —
+                guardrail restoration precedes any serving claim"}
+optimizations_lossless: []
+optimizations_bounded: []
+incompatibilities: []
+authenticity_signals:
+  - pipeline_call_signature_introspected
+validation:
+  - fixed_seed_smoke
+binding:
+  backend_version: "0.0.1a0"
+  hardware: 1xH200
+  cuda: ""
+  last_validated: "2026-07-26"
+  evidence_level: measured

@@ -1,0 +1,36 @@
+# V-JEPA 2 ViT-L — grounded in the onboarding smoke (job 201778) only.
+model_family: vjepa2-vitl
+detection_ids:
+  - facebook/vjepa2-vitl-fpc64-256
+  - "facebook/vjepa2-vitl*"
+components: [video_encoder, predictor]
+runtime_support:
+  - runtime: torch-local
+    tier: launchable
+    evidence:
+      - {kind: job_log, ref: "job 201778",
+         note: "predictor-rollout smoke: encode once 1199ms
+                (2048x1024 context), cached predictor loop 15.9ms/step
+                over 8 steps, peak VRAM 0.7GB; base masked prediction,
+                NOT the action-conditioned task"}
+optimizations_lossless:
+  - name: cached_context_rollout
+    quality_class: exact
+    evidence:
+      - {kind: job_log, ref: "job 201778",
+         note: "reusing the once-encoded context is the same
+                computation re-ordered, not an approximation: 15.9ms
+                per step vs ~1199ms naive re-encode (~75x)"}
+    notes: "the world-model serving lever: never re-prefill a rollout"
+optimizations_bounded: []
+incompatibilities: []
+authenticity_signals:
+  - rollout_path_recorded
+validation:
+  - fixed_seed_smoke
+binding:
+  backend_version: "0.0.1a0"
+  hardware: 1xH200
+  cuda: ""
+  last_validated: "2026-07-27"
+  evidence_level: measured

@@ -35,7 +35,8 @@ def _base_dict(**over) -> dict:
 
 def test_real_pack_loads_and_matches():
     profiles = load_profiles()
-    assert {"wan2.2-ti2v", "qwen3-vl", "openvla"} <= set(profiles)
+    assert {"wan2.2-ti2v", "qwen3-vl", "openvla",
+            "cosmos3-nano", "vjepa2-vitl"} <= set(profiles)
     for prof in profiles.values():
         assert prof.validate() == []
         assert prof.binding.evidence_level == "measured"
@@ -56,9 +57,9 @@ def test_real_pack_loads_and_matches():
 
 def test_real_pack_freshness_and_expiry():
     profiles = load_profiles()
-    assert stale_report(profiles, "2026-07-26") == []
-    stale = stale_report(profiles, "2027-01-01")
-    assert len(stale) == 3          # everything expires; nothing rots silently
+    assert stale_report(profiles, "2026-07-27") == []
+    stale = stale_report(profiles, "2027-06-01")
+    assert len(stale) == len(profiles)   # everything expires eventually
 
 
 # ------------------------------------------------------------- fail-closed
