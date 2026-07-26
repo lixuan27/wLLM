@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=wllm_cosmos3_smoke
+#SBATCH --job-name=wllm_cosmos3_smoke_r4
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -16,7 +16,8 @@
 set -uo pipefail
 echo "Job ID: $SLURM_JOB_ID"; echo "Node: $SLURM_NODELIST"; echo "Start: $(date)"
 cd /public/home/lixuan/lixuan/wllm-infra
-export HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+export TOKENIZERS_PARALLELISM=false
+export HF_HOME=/public/home/lixuan/lixuan/wllm-infra/checkpoints/hf_guardrail_cache HF_HUB_OFFLINE=1
 export PATH=/public/home/lixuan/lixuan/wllm-infra/.venv/bin:$PATH
 TODAY=$(date +%F)
 FAIL=0

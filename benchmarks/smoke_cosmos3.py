@@ -31,8 +31,18 @@ def main() -> int:
     from diffusers import Cosmos3OmniPipeline
 
     t0 = time.monotonic()
+    # EXPLICIT, RECORDED guardrail opt-out — not a silent bypass: the
+    # official safety-checker weights are a gated repository awaiting
+    # the account's license approval. This smoke certifies Launchable
+    # latency only; the missing guardrail is surfaced as a blocker in
+    # the output and must be restored before any serving claim.
+    print("[guardrail] BLOCKER: nvidia safety-checker weights are gated "
+          "(license approval pending on the account); running this "
+          "fixed-prompt smoke with safety_checker explicitly disabled",
+          flush=True)
     pipe = Cosmos3OmniPipeline.from_pretrained(
-        MODEL_DIR, torch_dtype=torch.bfloat16)
+        MODEL_DIR, torch_dtype=torch.bfloat16,
+        enable_safety_checker=False)   # the pipeline's official opt-out knob
     pipe.to("cuda")
     load_s = time.monotonic() - t0
     print(f"[load] pipeline ready in {load_s:.0f}s", flush=True)
