@@ -30,3 +30,4 @@ native/third_party/
 native/wllm_native/
 .coverage
 .wllm_coverage.txt
+.venv_shims/

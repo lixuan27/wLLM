@@ -39,8 +39,10 @@ def main() -> int:
         t0 = time.monotonic()
         kwargs = dict(trust_remote_code=True, torch_dtype=dtype,
                       low_cpu_mem_usage=True)
-        if attn_impl:
-            kwargs["attn_implementation"] = attn_impl
+        # explicit attention implementation: the staged remote code
+        # predates the _supports_sdpa probe of newer transformers, so an
+        # unset implementation crashes in the sdpa dispatch check
+        kwargs["attn_implementation"] = attn_impl or "eager"
         processor = AutoProcessor.from_pretrained(MODEL_DIR,
                                                   trust_remote_code=True)
         model = AutoModelForVision2Seq.from_pretrained(MODEL_DIR,

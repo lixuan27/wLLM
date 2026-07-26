@@ -26,6 +26,10 @@ validation:
 binding:
   backend_version: "0.0.1a0"
   hardware: 1xH200
+  # dependency matrix (measured the hard way, 2026-07-26): the staged
+  # remote code needs timm>=0.9.10,<1.0 AND lightweight constants/mask
+  # shims AND an explicit eager attention implementation on newer
+  # transformers; unpinned envs fail at four distinct layers.
   cuda: ""
   last_validated: "2026-07-24"
   evidence_level: measured

@@ -1,9 +1,13 @@
 """Model #2: Qwen3-VL-8B-Instruct (MLLM / AR-decode archetype).
 
 Baseline + optimized variants in one process.  Exact gate for AR greedy
-decoding is token-id equality — the clean counterpart to the diffusion
-trajectory-drift story: if compiled decode emits one different token the
-variant is refused, no tolerance needed.
+decoding is TIE-AWARE token-id equality (verifier law 2: ties are
+arbitration, not divergence).  On the first mismatching position the
+gate runs one teacher-forced forward on the reference prefix and
+measures the top-2 logit gap: the flip is accepted only if the two
+tokens ARE the top-2 pair within a bf16-resolution epsilon — proven,
+never assumed.  Anything else is refused with the measured gap as
+evidence.
 
 Levers: static KV cache, torch.compile on the language model.  Metrics:
 TTFT-proxy (prefill+first token), full-generation wall, tokens/s.
@@ -65,6 +69,32 @@ def main() -> int:
         return out[0, inputs["input_ids"].shape[1]:].tolist()
 
     ref_tokens = {}
+    TIE_GAP_EPS = 1e-3   # bf16 logit resolution; the Alpha flip had gap 0.0
+
+    def tie_adjudicate(pos: int, ref: list[int], got: list[int]):
+        """Teacher-forced forward on the reference prefix up to ``pos``.
+
+        Returns (is_tie, gap, top2_ids): the flip counts as arbitration
+        only if {ref[pos], got[pos]} is exactly the top-2 logit pair and
+        their gap is within epsilon. One extra forward per adjudication
+        — measured evidence, not tolerance hand-waving.
+        """
+        ids = inputs["input_ids"]
+        if pos:
+            ext = torch.tensor([ref[:pos]], device=ids.device,
+                               dtype=ids.dtype)
+            ids = torch.cat([ids, ext], dim=1)
+        fwd = dict(inputs)
+        fwd["input_ids"] = ids
+        if "attention_mask" in fwd:
+            fwd["attention_mask"] = torch.ones_like(ids)
+        with torch.inference_mode():
+            logits = model(**fwd).logits[0, -1].float()
+        top2 = torch.topk(logits, 2)
+        gap = float(top2.values[0] - top2.values[1])
+        pair = set(top2.indices.tolist())
+        return ({ref[pos], got[pos]} == pair and gap <= TIE_GAP_EPS,
+                gap, sorted(pair))
 
     def apply(plan_id: str):
         if plan_id == "ar_base":
@@ -92,10 +122,37 @@ def main() -> int:
             ref_tokens["ar_base"] = toks
             exact, err = True, ""
         else:
-            exact = toks == ref_tokens["ar_base"]
-            err = "" if exact else (
-                f"greedy token mismatch at pos "
-                f"{next(i for i, (a, b) in enumerate(zip(toks, ref_tokens['ar_base'])) if a != b) if any(a != b for a, b in zip(toks, ref_tokens['ar_base'])) else 'len'}")
+            ref = ref_tokens["ar_base"]
+            exact = toks == ref
+            err = ""
+            if not exact:
+                mism = [i for i, (a, b) in enumerate(zip(toks, ref))
+                        if a != b]
+                if not mism:
+                    err = (f"length mismatch (EOS timing): "
+                           f"{len(toks)} vs {len(ref)} tokens")
+                else:
+                    pos = mism[0]
+                    is_tie, gap, pair = tie_adjudicate(pos, ref, toks)
+                    if is_tie:
+                        exact = True
+                        print(f"[tie-gate] {plan.id}: flip at pos {pos} "
+                              f"adjudicated as argmax tie (top-2 gap "
+                              f"{gap:.2e}, pair {pair}); accepted per "
+                              f"tie-aware exact", flush=True)
+                    else:
+                        # KNOWN LIMITATION (observed live): the
+                        # adjudication forward is a PREFILL pass while
+                        # generation decodes incrementally; bf16 kernel
+                        # differences between the two paths can shift a
+                        # knife-edge tie so the flip tokens miss the
+                        # teacher-forced top-2. Refusing is the safe
+                        # verdict; the full diagnostic makes the case
+                        # auditable.
+                        err = (f"greedy token mismatch at pos {pos}: "
+                               f"ref={ref[pos]} got={toks[pos]}, "
+                               f"teacher-forced top2 {pair} gap "
+                               f"{gap:.4f} — not adjudicable as a tie")
         n_tok = len(toks)
         return Measurement(plan_id=plan.id, duration_s=duration_s, ok=exact,
                            latency_ms=med,
