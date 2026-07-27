@@ -37,7 +37,7 @@ python -m coverage run -m pytest -q tests/test_control_plane.py tests/test_bdd_s
     tests/test_candidates.py tests/test_composite_walks.py \
     tests/test_guardrail.py \
     tests/test_adjudicate.py tests/test_planner_toy.py \
-    tests/test_step_cache_tensor.py \
+    tests/test_step_cache_tensor.py tests/test_plugin_package.py \
   && python -m coverage report --fail-under=85 | tee .wllm_coverage.txt || FAIL=1
 
 step "real-evidence receipt (wan22 CFG branch-parallel, job 196293)"
