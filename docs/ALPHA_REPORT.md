@@ -6,6 +6,31 @@ produced by wLLM's own machinery (L1 `Application` wrap / plan family
 generation / `successive_halving` measurement / verifier gates) — no
 hand-tuned deployments.
 
+> **Correction posted 2026-07-27 — the Qwen3-VL row below is WITHDRAWN.**
+> This report is left as written, because a dated report that is edited to
+> match later knowledge stops being evidence of anything. Read the row,
+> then read this.
+>
+> The 2.75× `static KV cache` result was accepted as *tie-aware exact*
+> under a rule that adjudicated the disputed token on the teacher-forced
+> **prefill** path alone. Under the current rule — ε-optimal set **and**
+> prefill/decode consistency — it could not be re-established (job
+> 202244): the token mismatch is still there, and the adjudicator that
+> would decide arbitration-vs-divergence **crashes** on this model's
+> multimodal path. Status: **unproven, not disproven**; no evidence is
+> not a pass.
+>
+> A second finding (job 202214, on a different model) makes the
+> withdrawal substantive rather than procedural: on this runtime,
+> requesting a static cache **silently also enables a compiled forward**,
+> so a leg labelled "static KV cache" measures a composition — and
+> compiled decode is already classified *bounded* by measurement, with
+> drift of exactly one bf16 ULP. The separation experiment is running.
+>
+> Consequence for the headline: with this row withdrawn, the "median
+> 2.75× across three models" sentence below no longer has three
+> substantiated models behind it.
+
 ## Scorecard
 
 | Model (archetype) | Naive baseline | Best plan | Speedup | Verdict class | Jobs |

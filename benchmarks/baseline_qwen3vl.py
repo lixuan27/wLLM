@@ -6,15 +6,16 @@ disagreement can be arbitration rather than divergence).
 
 The adjudication rule is NOT inline here — it lives in
 ``wllm.verify.adjudicate`` so every benchmark shares one audited,
-unit-tested implementation.  On the first mismatching position the gate
-measures the logit row twice: once by teacher-forced prefill over the
-reference prefix, once by replaying that prefix through incremental
-decode with a KV cache.  The flip is accepted only if BOTH disputed
-tokens sit within epsilon of the maximum logit (epsilon-optimal set)
-*and* the two measurement paths agree.  Paths that disagree yield
-``undecidable`` and the plan is refused: a knife edge that moves when
-you change how you measure it has not been proven benign.  Everything
-else is refused with the measured gaps as evidence.
+unit-tested implementation.  It censuses every disagreeing position,
+measures a bounded deterministic sample of them (first, last, and an
+even spread between) on BOTH the teacher-forced prefill path and the
+incremental KV-cache decode path, and aggregates conservatively: the
+plan is exact only if every examined position has both disputed tokens
+inside the epsilon-optimal set AND both measurement paths agree, the
+disagreement is not widespread enough to be a trajectory fork, and the
+two runs emitted the same number of tokens.  Anything else — a decisive
+gap, paths that disagree, a degenerate row — is a refusal carrying the
+measured gaps and the count of unexamined positions as evidence.
 
 Levers: static KV cache, torch.compile on the language model.  Metrics:
 TTFT-proxy (prefill+first token), full-generation wall, tokens/s.
@@ -125,7 +126,7 @@ def main() -> int:
                                                     epsilon=TIE_GAP_EPS)
                     except Exception as exc:                   # noqa: BLE001
                         adj = None
-                        err = (f"greedy token mismatch at pos {pos}: "
+                        err = (f"greedy token mismatch from pos {pos}: "
                                f"ref={div.reference_token} "
                                f"got={div.candidate_token}; adjudication "
                                f"could not be measured "
@@ -145,10 +146,11 @@ def main() -> int:
                         else:
                             # verdict is real_divergence or undecidable;
                             # both are refusals, with different diagnoses
-                            err = (f"greedy token mismatch at pos {pos}: "
-                                   f"ref={div.reference_token} "
-                                   f"got={div.candidate_token} -> "
-                                   f"{adj.verdict}; {adj.reason}")
+                            err = (f"greedy token mismatch from pos {pos} "
+                                   f"({adj.positions_disagreeing} of "
+                                   f"{adj.positions_compared} positions "
+                                   f"disagree) -> {adj.verdict}; "
+                                   f"{adj.reason}")
                             print(f"[tie-gate] {plan.id}: REFUSED "
                                   f"{adj.summary()}", flush=True)
         n_tok = len(toks)

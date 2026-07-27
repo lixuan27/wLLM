@@ -12,6 +12,7 @@ action walks without duplicating the model.
     walks.py     named walk sets + per-request walk state machines
     executor.py  walk execution with session-state isolation + placement
     batching.py  cross-request step batching with per-request parity
+    rendezvous.py  concurrent walks -> one batched step call
     chunking.py  chunk policies on streaming edges
     lowering.py  DeploymentPlan -> component placement, fail-closed
 """
@@ -19,8 +20,9 @@ action walks without duplicating the model.
 from .graph import Component, ComponentGraph, Edge
 from .walk import Loop, Par, Seq, Stream, Walk
 from .walks import RequestResult, WalkSet, WalkStateMachine, run_request
-from .executor import SessionStore, WalkExecutor
-from .batching import StepBatcher
+from .executor import SessionStore, WalkExecutor, current_session
+from .batching import StepBatcher, StepRequest
+from .rendezvous import GateStats, StepGate
 from .chunking import (ChunkedChannel, ChunkPolicy, FixedChunk,
                        LeftContext, SlidingWindow)
 from .lowering import LoweringReport, lower_plan, require
@@ -29,7 +31,8 @@ __all__ = [
     "Component", "ComponentGraph", "Edge",
     "Seq", "Par", "Loop", "Stream", "Walk",
     "RequestResult", "WalkSet", "WalkStateMachine", "run_request",
-    "SessionStore", "WalkExecutor", "StepBatcher",
+    "SessionStore", "WalkExecutor", "current_session",
+    "StepBatcher", "StepRequest", "GateStats", "StepGate",
     "ChunkPolicy", "ChunkedChannel", "FixedChunk", "LeftContext",
     "SlidingWindow",
     "LoweringReport", "lower_plan", "require",

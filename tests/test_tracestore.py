@@ -1,6 +1,6 @@
 """Trace-store unit tests: round-trip, fail-closed validation, dedup,
 query filters, failure patterns, known-bad lookup, corrupt-line
-tolerance, and the beta seed (six real traces, idempotent).
+tolerance, and the beta seed (real measured traces, idempotent).
 
 The trace store is the project's append-only experiment memory —
 failures persist with their reasons so a planner never re-explores a
@@ -226,27 +226,27 @@ def test_seed_beta_traces_idempotent():
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "beta.jsonl"
         st = TraceStore(path)
-        assert seed_beta_traces(st) == 7
-        assert len(st.all()) == 7
+        assert seed_beta_traces(st) == 8
+        assert len(st.all()) == 8
         assert seed_beta_traces(st) == 0    # second run adds nothing
-        assert st.deduped == 7
+        assert st.deduped == 8
         st2 = TraceStore(path)              # fresh load, same result
-        assert st2.corrupt_lines == 0 and len(st2.all()) == 7
+        assert st2.corrupt_lines == 0 and len(st2.all()) == 8
         assert seed_beta_traces(st2) == 0
         lines = [x for x in path.read_text().splitlines() if x.strip()]
-        assert len(lines) == 7
+        assert len(lines) == 8
 
 
 def test_seed_content_matches_reports():
     seeds = beta_seed_traces()
-    assert len(seeds) == 7
+    assert len(seeds) == 8
     for t in seeds:
         assert t.validate() == [], t
         assert t.evidence, "every seed must point at real evidence"
         assert t.recorded in ("2026-07-24", "2026-07-25", "2026-07-27")
     accepted = [t for t in seeds if t.status == "accepted"]
     rejected = [t for t in seeds if t.status == "rejected"]
-    assert len(accepted) == 3 and len(rejected) == 4
+    assert len(accepted) == 3 and len(rejected) == 5
     # the corpus must contain at least one candidate that was FAST and
     # refused anyway; without such a row a speed-only planner would look
     # indistinguishable from ours on this evidence
@@ -278,7 +278,15 @@ def test_seed_content_matches_reports():
         assert set(pat) == {"cfg_batched",
                             "torch_compile_max_autotune",
                             "torch_compile_reduce_overhead",
-                            "reuse_cache"}
+                            "reuse_cache",
+                            "static_kv_cache"}   # withdrawn 2026-07-27
+        # the withdrawal must SUPERSEDE the acceptance rather than erase
+        # it: the accepted row is still in history, and the planner's
+        # known_bad answer flips to rejected because the later trace wins
+        assert len(st.query(pass_name="static_kv_cache")) == 2
+        withdrawn = st.known_bad("Qwen/Qwen3-VL-8B-Instruct", "1xH200",
+                                 {"pass": "static_kv_cache", "gpus": 1})
+        assert withdrawn is not None and "UNPROVEN" in withdrawn.reason
         for reasons in pat.values():
             assert all(r.strip() for r in reasons)
 

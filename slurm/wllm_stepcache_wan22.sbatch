@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=wllm_stepcache_wan22_v2
+#SBATCH --job-name=wllm_stepcache_wan22_v3_50step
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -16,6 +16,8 @@ set -uo pipefail
 echo "Job ID: $SLURM_JOB_ID"; echo "Node: $SLURM_NODELIST"; echo "Start: $(date)"
 cd /public/home/lixuan/lixuan/wllm-infra
 export TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1
+# round 3: does a finer schedule create the redundancy the technique needs?
+export WLLM_STEPCACHE_STEPS=${WLLM_STEPCACHE_STEPS:-50}
 TODAY=$(date +%F)
 FAIL=0
 

@@ -1,4 +1,29 @@
-# Qwen3-Omni 30B-A3B — grounded in the onboarding smoke (job 202109) only.
+# Qwen3-Omni 30B-A3B — grounded in the onboarding smoke (job 202109) and
+# the AR-decode optimization sweep (job 202214) only.
+#
+# READ THIS BEFORE CONCLUDING "NOBODY TRIED": optimizations_lossless is
+# empty because an exact-quality decode sweep RAN and every candidate was
+# REFUSED with a measured reason — not because the question was never
+# asked. The eight per-leg outcomes (2 accepted reference baselines, 6
+# rejections with reasons) are in .wllm/traces/beta.jsonl under job
+# 202214, and the per-leg evidence is below.
+#
+# Attribution caveat that anyone re-reading the 4.3x number must keep:
+# in this runtime, requesting a static KV cache ALSO puts generate() on
+# an auto-compiled forward (the compile criterion fires for any
+# compileable non-dynamic cache), so the leg measured the COMPOSITION of
+# cache + auto-compile. Neither the speed nor the numeric drift can be
+# attributed to the cache alone; separating them is UNMEASURED and
+# therefore claimed nowhere in this file.
+#
+# Second caveat, same class: the runtime swaps the routed-expert kernel
+# from grouped_mm to batched_mm for the DECODE phase only and restores it
+# afterwards. So the config value below describes prefill; the reference
+# leg and the batched_mm leg decoded with the same kernel, which is why
+# that leg measured 1.00x with byte-identical tokens.
+#
+# Tier stays "launchable": nothing was promoted, so nothing here claims
+# more than "the thinker text path runs end-to-end and was measured".
 model_family: qwen3-omni
 detection_ids:
   - Qwen/Qwen3-Omni-30B-A3B-Instruct
@@ -14,13 +39,46 @@ runtime_support:
                 talker disabled via disable_talker() and
                 generate(return_audio=False) — the audio-out chain is
                 UNMEASURED and not claimed here"}
-optimizations_lossless: []
-optimizations_bounded: []
+      - {kind: job_log, ref: "job 202214",
+         note: "AR decode sweep, single load, 80-token prompt, forced
+                greedy lengths (min_new_tokens == max_new_tokens) so no
+                leg can win by stopping early. REFERENCE LEG (declared
+                bf16, dynamic cache, config experts grouped_mm, attn
+                sdpa): 2640 ms / 24.25 tok/s at 64 new tokens and
+                9906 ms / 25.84 tok/s at 256, peak VRAM 59.3GB, median
+                of 3 timed reps after a warmup. This reproduces the
+                202109 smoke to within 0.2 percent."}
+      - {kind: job_log, ref: "job 202214",
+         note: "NO EXACT WIN FOUND — the measured attempt and its
+                refusals. static KV cache: 4.47x at 64 tokens and 4.32x
+                at 256 (590/2296 ms, up to 111 tok/s), authenticity
+                confirmed by the realized cache class StaticCache, but
+                REFUSED by the token-parity gate — at 64 tokens both
+                adjudication paths agree on real_divergence (decisive
+                logit gap 0.125 against epsilon 1e-3, with 57 of 64
+                positions disagreeing), and at 256 the prefill and
+                decode paths disagree (benign_tie vs real_divergence),
+                which the dual-path rule returns as undecidable. The
+                0.125 gaps are one bf16 ULP at that logit magnitude,
+                i.e. genuine reordering drift, consistent with this
+                leg running an auto-compiled forward. routed-expert
+                kernel batched_mm: exact (identical at 64, adjudicated
+                benign_tie at 256) but 1.003x / 0.984x, i.e. no benefit,
+                and +5.5GB peak VRAM — it only changes prefill, since
+                the runtime already decodes with that kernel. eager:
+                REFUSED, real_divergence at both lengths, and 0.34x
+                (2.9x SLOWER). No combined leg was run because no
+                expert kernel cleared the 1.05x bar."}
+optimizations_lossless: []   # measured empty (job 202214), not untried
+optimizations_bounded: []    # nothing here has a measured quality budget
 incompatibilities: []
 authenticity_signals:
   - path_notes_recorded
+  - cache_class_recorded
+  - experts_impl_recorded
 validation:
   - fixed_prompt_greedy_smoke
+  - decode_token_parity_dual_path
 binding:
   backend_version: "0.0.1a0"
   hardware: 1xH200

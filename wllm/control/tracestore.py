@@ -357,6 +357,28 @@ def beta_seed_traces() -> list[Trace]:
                        "steps_total": 20},
               evidence="job 202206 (logs/wllm_stepcache_wan22_202206.out)",
               recorded="2026-07-27"),
+        # job 202244: the 2.75x static-KV acceptance above, re-verified
+        # under the strengthened adjudication rule and WITHDRAWN. This
+        # row exists to exercise the store's own supersession semantics
+        # on a real claim: it does not edit the 2026-07-24 acceptance,
+        # it out-dates it, so history stays readable and known_bad now
+        # answers "rejected" for this config.
+        Trace(model="Qwen/Qwen3-VL-8B-Instruct", hardware="1xH200",
+              runtime="wllm-serving",
+              workload="AR decode, 128 new tokens",
+              candidate={"pass": "static_kv_cache", "gpus": 1},
+              status="rejected",
+              reason="claim withdrawn as UNPROVEN, not disproven: the "
+                     "greedy mismatch persists (pos 43, ref 3691 vs "
+                     "6303) and the adjudicator that would rule it "
+                     "arbitration-or-divergence crashed on the "
+                     "multimodal path (mask 263 vs indexed tensor 220 — "
+                     "vision placeholder expansion desynchronizes the "
+                     "decode replay); no evidence is not a pass",
+              metrics={"speedup_unverified": 2.75, "baseline_ms": 2683.5},
+              evidence="job 202244 "
+                       "(logs/wllm_qwen3vl_dualpath_202244.out)",
+              recorded="2026-07-27"),
     ]
 
 

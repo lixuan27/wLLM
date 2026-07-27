@@ -15,6 +15,16 @@ through the walk, and enforces the contracts the IR declares:
 Component callables have the signature ``fn(ctx, state) -> dict`` where
 ``ctx`` is the walk context (merged into on return) and ``state`` is a
 mutable per-(session, component) mapping for its owned states.
+
+Concurrency. One executor may run walks for different sessions on
+different threads at the same time — that is the point of per-session
+state. What that costs is bounded: :class:`SessionStore` guards its map
+with a lock, ``channel`` keys include the session, and ``invocations``
+is only appended to. Two threads driving the SAME session concurrently
+is NOT supported (they would interleave writes into one state dict);
+callers serialize per session, which a request-per-session scheduler
+does for free. The session id of the walk running on the current
+thread is available to component code via :func:`current_session`.
 """
 
 from __future__ import annotations
@@ -27,6 +37,30 @@ from typing import Any, Callable
 from ..graph.streams import Backpressure
 from .graph import ComponentGraph
 from .walk import Loop, Par, Seq, Stream, Walk
+
+_CURRENT = threading.local()
+
+
+def current_session() -> str:
+    """Session id of the walk running on this thread.
+
+    A component receives ``(ctx, state)``: ctx is walk data and state is
+    already scoped for it, so neither carries the request identity. A
+    component that must key an EXTERNAL resource by request — a batching
+    gate, a device slot, a KV pool — needs that identity anyway. It is
+    exposed as thread-local runtime context rather than as a ctx key so
+    that it cannot be written by a component, cannot leak into a walk's
+    outputs, and cannot be mistaken for model data.
+
+    Raises ``RuntimeError`` outside a walk: there is no default session,
+    and guessing one would silently cross-wire two requests.
+    """
+    session = getattr(_CURRENT, "session", None)
+    if session is None:
+        raise RuntimeError(
+            "current_session() called outside a walk; the executor binds "
+            "it only for the duration of WalkExecutor.run()")
+    return session
 
 
 class SessionStore:
@@ -141,8 +175,15 @@ class WalkExecutor:
         if errs:
             raise ValueError(f"invalid walk: {errs}")
         ctx = dict(ctx or {})
-        for step in walk.steps:
-            ctx = self._step(step, session, ctx)
+        # bind the running session for component code; restore rather than
+        # clear on exit so a nested run() cannot orphan its caller's binding
+        previous = getattr(_CURRENT, "session", None)
+        _CURRENT.session = session
+        try:
+            for step in walk.steps:
+                ctx = self._step(step, session, ctx)
+        finally:
+            _CURRENT.session = previous
         return ctx
 
     def _step(self, step, session: str, ctx: dict) -> dict:

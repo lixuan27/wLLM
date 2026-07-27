@@ -8,7 +8,7 @@ quality regression.  Divergence is when the candidate picks a token the
 reference model does not consider optimal at all.
 
 This module owns that decision so that no benchmark has to reimplement
-it.  Two rules are enforced.
+it.  Three rules are enforced.
 
 **Rule A — epsilon-optimal set.**  Given the logit row for the disputed
 position, let ``m = max(row)``.  The disagreement is benign iff *both*
@@ -30,15 +30,63 @@ verdict is only the shared verdict of the two paths; **if the paths
 disagree the outcome is ``undecidable``, never a pass**.  A tie that
 flips depending on how it is measured has not been proven to be a tie.
 
+**Rule C — generation-level aggregation.**  Rules A and B rule on ONE
+position.  A generation usually disagrees at many (a live MoE run
+disagreed at 227 of 256 positions), and a verdict about the whole
+generation read off a single position is not sound: the first position
+can be a benign tie while a later one is a decisive divergence.  So a
+bounded, deterministic sample of the disagreeing positions is examined
+(see :func:`select_positions`) and aggregated **conservatively**:
+
+* any examined position is a real divergence -> ``real_divergence``;
+* else any examined position is undecidable -> ``undecidable``;
+* else (every examined position benign) -> ``benign_tie``.
+
+Positions that were not examined are never treated as benign; the count
+of unexamined positions is stated in the reason so the residual risk is
+visible instead of inferred away.
+
+Rule C also caps the verdict on two whole-generation facts that no
+per-position gap can see:
+
+1. *Disagreement fraction.*  A knife-edge tie is a rare coincidence —
+   two logits out of a ~150k vocabulary landing within ``epsilon``.  When
+   a large fraction of positions disagree, the likelier explanation is
+   that the two numerics regimes differ systematically, and in any case
+   the sequences have forked: this is a trajectory phenomenon (verifier
+   law 1's logic applied to AR decode), not a knife edge.  Above
+   ``max_disagreement_fraction`` the best available verdict is capped at
+   ``undecidable``.  The default (5%) is a stated convention, not a
+   fitted constant; the observed cases sit far to either side of it
+   (a historical accepted case at 0.8%, the refused MoE legs at 19–89%),
+   so no verdict to date turns on its exact value.  The cap needs
+   something to have compounded, so it applies only when more than one
+   position disagrees: a single disagreement is a knife edge by
+   construction, and a short generation must not be refused merely for
+   being short.
+2. *Length.*  A candidate that emits a different number of tokens
+   stopped somewhere else; that is not token-exact whatever the gaps
+   say, so the verdict is capped at ``undecidable``.
+
+*Known scope limit, stated rather than papered over*: a position after
+the first is adjudicated against the **reference** prefix, because that
+is the only prefix both runs can be asked about.  Once the sequences
+fork, the candidate's own conditioning differs, so those positions are
+counterfactual checks — they can refuse a candidate but cannot by
+themselves prove the candidate's actual trajectory optimal.  That
+asymmetry is exactly why the fraction cap exists, and it is disclosed in
+the result's ``notes``.
+
 ``undecidable`` is a first-class outcome, distinct from
 ``real_divergence``: it says "this measurement cannot certify anything",
 which is the honest verdict when the evidence is self-contradictory,
 degenerate, or absent.  Callers must treat it as a refusal.
 
-The core (:func:`first_divergence`, :func:`adjudicate_row`,
-:func:`adjudicate`) is backend-free: it takes plain sequences of floats
-(python lists, tuples, or anything with ``tolist()`` such as numpy or
-torch tensors) and runs on CPU with no torch import.  The torch-backed
+The core (:func:`first_divergence`, :func:`divergence_positions`,
+:func:`select_positions`, :func:`adjudicate_row`, :func:`adjudicate`,
+:func:`aggregate_positions`) is backend-free: it takes plain sequences of
+floats (python lists, tuples, or anything with ``tolist()`` such as numpy
+or torch tensors) and runs on CPU with no torch import.  The torch-backed
 adapters at the bottom of this file import torch lazily *inside* the
 function bodies, so importing this module never drags in a GPU stack.
 """
@@ -71,9 +119,31 @@ IDENTICAL = "identical"
 TOKEN_MISMATCH = "token_mismatch"
 LENGTH_MISMATCH = "length_mismatch"
 
+#: How many disagreeing positions Rule C examines per generation.  Each
+#: examined position costs one prefill forward, and the decode rows for
+#: the whole sample come from ONE shared incremental replay, so the cost
+#: is ``budget + max(position)`` forwards rather than the quadratic
+#: ``sum(position)``.  Eight gives head/middle/tail coverage for a
+#: few-hundred-token generation at a few seconds on one GPU.
+POSITION_BUDGET_DEFAULT = 8
+
+#: Above this fraction of disagreeing positions the disagreement is a
+#: trajectory phenomenon rather than a knife edge, and the verdict is
+#: capped at ``undecidable`` (see Rule C in the module docstring).  A
+#: stated convention, not a fitted constant.
+DISAGREEMENT_FRACTION_DEFAULT = 0.05
+
 #: How many leading singleton dimensions a logit row may carry, so that
 #: ``[[...]]`` (batch of one) and ``[[[...]]]`` are accepted as rows.
 _MAX_SQUEEZE = 2
+
+#: Disclosed on every multi-position verdict — see the module docstring's
+#: "known scope limit".
+_COUNTERFACTUAL_NOTE = (
+    "positions after the first are adjudicated against the REFERENCE "
+    "prefix; once the sequences fork the candidate's own conditioning "
+    "differs, so those checks can refuse a candidate but cannot by "
+    "themselves prove its actual trajectory optimal")
 
 
 # ------------------------------------------------------------------- results
@@ -172,6 +242,67 @@ class Adjudication:
             "dual_path": self.dual_path,
             "evidence": {name: ev.as_dict()
                          for name, ev in self.evidence.items()},
+            "reason": self.reason,
+            "notes": list(self.notes),
+        }
+
+
+@dataclass(frozen=True)
+class GenerationVerdict:
+    """Rule C: one verdict about a whole generation, with its census.
+
+    ``verdict`` uses the same vocabulary as :class:`Adjudication`.  The
+    census fields are the point: a reader must be able to see how much of
+    the disagreement was actually looked at, and how much was not.
+    """
+
+    verdict: str
+    epsilon: float
+    reason: str
+    positions_compared: int
+    positions_disagreeing: int
+    positions_examined: tuple[int, ...] = ()
+    per_position: tuple[Adjudication, ...] = ()
+    max_disagreement_fraction: float = DISAGREEMENT_FRACTION_DEFAULT
+    reference_length: int | None = None
+    candidate_length: int | None = None
+    notes: tuple[str, ...] = ()
+
+    @property
+    def is_benign(self) -> bool:
+        """True only for :data:`BENIGN_TIE` — fail closed everywhere else."""
+        return self.verdict == BENIGN_TIE
+
+    @property
+    def positions_unexamined(self) -> int:
+        """Disagreeing positions no measurement was made at."""
+        return self.positions_disagreeing - len(self.positions_examined)
+
+    @property
+    def disagreement_fraction(self) -> float:
+        return self.positions_disagreeing / self.positions_compared
+
+    def summary(self) -> str:
+        return (f"[adjudicate] generation -> {self.verdict} "
+                f"(eps={self.epsilon:g}; examined "
+                f"{len(self.positions_examined)} of "
+                f"{self.positions_disagreeing} disagreeing positions over "
+                f"{self.positions_compared} compared, "
+                f"{self.positions_unexamined} unexamined) {self.reason}")
+
+    def as_dict(self) -> dict:
+        return {
+            "verdict": self.verdict,
+            "epsilon": self.epsilon,
+            "positions_compared": self.positions_compared,
+            "positions_disagreeing": self.positions_disagreeing,
+            "positions_examined": list(self.positions_examined),
+            "positions_unexamined": self.positions_unexamined,
+            "disagreement_fraction": self.disagreement_fraction,
+            "max_disagreement_fraction": self.max_disagreement_fraction,
+            "reference_length": self.reference_length,
+            "candidate_length": self.candidate_length,
+            "per_position": [a.as_dict() for a in self.per_position],
             "reason": self.reason,
             "notes": list(self.notes),
         }
@@ -320,6 +451,179 @@ def first_divergence(reference: Any, candidate: Any) -> Divergence:
                 f"lengths differ (reference {len(ref)} vs candidate "
                 f"{len(cand)}): an end-of-sequence timing difference, not "
                 f"a token disagreement"))
+
+
+def divergence_positions(reference: Any, candidate: Any) -> tuple[int, ...]:
+    """Every position at which the two sequences hold different token ids.
+
+    Only the shared prefix is compared; a length difference is reported
+    separately (see :func:`first_divergence`) because it is a different
+    kind of fact.  Returns positions in increasing order.
+    """
+    ref = list(reference)
+    cand = list(candidate)
+    shared = min(len(ref), len(cand))
+    return tuple(i for i in range(shared) if ref[i] != cand[i])
+
+
+def select_positions(positions: Any,
+                     budget: int = POSITION_BUDGET_DEFAULT) -> tuple[int, ...]:
+    """Bounded, deterministic sample of the disagreeing positions.
+
+    The scheme is **first, last, and an even spread between them**:
+
+    * the *first* disagreement is always examined — it is the only
+      position whose adjudication is not confounded by prefix divergence,
+      since both runs share an identical history up to it, so it carries
+      the strongest evidence available;
+    * the *last* is always examined — divergence compounds along a
+      generation, so sampling only the head would systematically
+      under-detect a trajectory that separates late;
+    * the *middle* is covered by an even, arithmetic spread, so the
+      sample is reproducible from the inputs alone.  Nobody — agent or
+      human — gets to choose which positions are looked at, and a receipt
+      can be replayed exactly.
+
+    The same deterministic-spread idiom is used by
+    ``scripts/mutation_smoke.py`` to pick mutation sites; this is that
+    convention, not new machinery.  Budgets at or above the number of
+    disagreements examine all of them.
+    """
+    seq = tuple(int(p) for p in positions)
+    if budget < 1:
+        raise ValueError(f"position budget must be >= 1, got {budget}")
+    if not seq:
+        return ()
+    if budget == 1:
+        return (seq[0],)                 # the one unconfounded position
+    last = len(seq) - 1
+    picked = {seq[round(i * last / (budget - 1))] for i in range(budget)}
+    return tuple(sorted(picked))
+
+
+def _check_fraction(value: Any) -> float:
+    try:
+        frac = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"max_disagreement_fraction must be a number, got "
+            f"{value!r}") from exc
+    if not math.isfinite(frac):
+        raise ValueError(f"max_disagreement_fraction must be finite, got {frac!r}")
+    if frac < 0.0:
+        raise ValueError(f"max_disagreement_fraction must be >= 0, got {frac!r}")
+    if frac > 1.0:
+        raise ValueError(f"max_disagreement_fraction must be <= 1, got {frac!r}")
+    return frac
+
+
+def aggregate_positions(
+        adjudications: Any, *, positions_compared: int,
+        positions_disagreeing: int,
+        epsilon: float = EPSILON_DEFAULT,
+        max_disagreement_fraction: float = DISAGREEMENT_FRACTION_DEFAULT,
+        reference_length: int | None = None,
+        candidate_length: int | None = None,
+        notes: tuple[str, ...] = ()) -> GenerationVerdict:
+    """Rule C: fold per-position verdicts into one generation verdict.
+
+    Backend-free, so the aggregation rule is unit-testable without a
+    model.  Aggregation is conservative (``real_divergence`` beats
+    ``undecidable`` beats ``benign_tie``) and then capped by the
+    disagreement fraction and by a length difference.  Unexamined
+    positions are counted and disclosed, never assumed benign.
+    """
+    eps = _check_epsilon(epsilon)
+    cap = _check_fraction(max_disagreement_fraction)
+    per_position = tuple(adjudications)
+    if not per_position:
+        raise ValueError(
+            "no adjudicated positions: a generation verdict must rest on at "
+            "least one measured position")
+    if positions_compared < 1:
+        raise ValueError(
+            f"positions_compared must be >= 1, got {positions_compared}")
+    if positions_disagreeing > positions_compared:
+        raise ValueError(
+            f"positions_disagreeing ({positions_disagreeing}) exceeds "
+            f"positions_compared ({positions_compared})")
+    if len(per_position) > positions_disagreeing:
+        raise ValueError(
+            f"examined {len(per_position)} positions but only "
+            f"{positions_disagreeing} disagree")
+    for adj in per_position:
+        if adj.position is None:
+            raise ValueError(
+                "every adjudicated position must carry its index: a census "
+                "cannot count positions it cannot name")
+        if adj.position >= positions_compared:
+            raise ValueError(
+                f"adjudicated position {adj.position} is outside the "
+                f"{positions_compared} compared positions")
+
+    verdicts = [a.verdict for a in per_position]
+    if REAL_DIVERGENCE in verdicts:
+        verdict = REAL_DIVERGENCE
+    elif UNDECIDABLE in verdicts:
+        verdict = UNDECIDABLE
+    else:
+        verdict = BENIGN_TIE
+
+    examined = tuple(a.position for a in per_position)
+    unexamined = positions_disagreeing - len(per_position)
+    fraction = positions_disagreeing / positions_compared
+    parts = [
+        f"examined {len(per_position)} of {positions_disagreeing} "
+        f"disagreeing positions ({positions_disagreeing} of "
+        f"{positions_compared} compared positions disagree = "
+        f"{fraction:.1%}); {unexamined} disagreeing positions were NOT "
+        f"examined and are NOT certified benign"]
+
+    if verdict == BENIGN_TIE:
+        # the fraction cap is about compounding, so it needs something to
+        # have compounded: a SINGLE disagreement is a knife edge by
+        # construction (a trajectory fork would have shown up downstream
+        # too), and short generations must not be refused just for being
+        # short.  Two or more is where "many positions disagree" starts
+        # to mean something.
+        if positions_disagreeing > 1:
+            if fraction > cap:
+                verdict = UNDECIDABLE
+                parts.append(
+                    f"every examined position is a benign tie, but "
+                    f"{fraction:.1%} of positions disagree, above the "
+                    f"{cap:.1%} budget: at this scale the sequences have "
+                    f"forked and the disagreement is a trajectory "
+                    f"phenomenon, not a knife edge — per-position tie "
+                    f"adjudication cannot license an exact verdict here")
+    if verdict == BENIGN_TIE:
+        if reference_length != candidate_length:
+            verdict = UNDECIDABLE
+            parts.append(
+                f"every examined position is a benign tie, but the runs "
+                f"emitted different token counts (reference "
+                f"{reference_length} vs candidate {candidate_length}): a "
+                f"generation that stops somewhere else is not token-exact")
+
+    deciding = [a for a in per_position if a.verdict == verdict]
+    if not deciding:
+        deciding = list(per_position)
+    parts.append("deciding evidence: " + " | ".join(
+        f"pos {a.position}: {a.reason}" for a in deciding[:3]))
+
+    all_notes = list(notes)
+    if positions_disagreeing > 1:
+        if _COUNTERFACTUAL_NOTE not in all_notes:
+            all_notes.append(_COUNTERFACTUAL_NOTE)
+
+    return GenerationVerdict(
+        verdict=verdict, epsilon=eps, reason="; ".join(parts),
+        positions_compared=positions_compared,
+        positions_disagreeing=positions_disagreeing,
+        positions_examined=examined, per_position=per_position,
+        max_disagreement_fraction=cap,
+        reference_length=reference_length, candidate_length=candidate_length,
+        notes=tuple(all_notes))
 
 
 # ------------------------------------------------------------ core adjudication
@@ -480,34 +784,52 @@ def prefill_logit_row(model: Any, inputs: dict, prefix_token_ids) -> list[float]
     return out.logits[0, -1].float().tolist()
 
 
-def decode_logit_row(model: Any, inputs: dict, prefix_token_ids) -> list[float]:
-    """Incremental-decode row for the position after ``prefix_token_ids``.
+def decode_logit_rows(model: Any, inputs: dict, reference_tokens,
+                      positions) -> dict[int, list[float]]:
+    """Incremental-decode rows for several positions in ONE replay.
 
-    Replays the actual generation path: one forward over the prompt with
-    ``use_cache=True``, then one single-token forward per prefix token
-    against the returned KV cache, growing ``attention_mask`` by one each
-    step.  Returns ``logits[0, -1]`` of the final step — the row greedy
-    decoding would have argmaxed to emit the disputed token.
+    Replays the actual generation path once: a forward over the prompt
+    with ``use_cache=True``, then one single-token forward per reference
+    token against the returned KV cache, growing ``attention_mask`` by
+    one each step.  The row read after consuming ``k`` reference tokens
+    IS the row for position ``k`` — the row greedy decoding would have
+    argmaxed to emit that token — so a single replay up to the largest
+    requested position serves every smaller one.  That makes the cost
+    ``1 + max(positions)`` forwards instead of ``sum(positions)``.
 
-    Raises ``RuntimeError`` if the model returns no KV cache (the replay
-    would then silently degenerate into repeated prefills).  Callers are
-    expected to treat any failure here as "decode path unavailable" and
-    fall back to a single-path, explicitly-labelled verdict.
+    Returns ``{position: row}``.  Raises ``RuntimeError`` if the model
+    returns no KV cache (the replay would otherwise silently degenerate
+    into repeated prefills).  Callers are expected to treat any failure
+    here as "decode path unavailable" and fall back to a single-path,
+    explicitly-labelled verdict.
     """
     import torch
 
+    wanted = sorted({int(p) for p in positions})
+    if not wanted:
+        raise ValueError("no positions requested")
+    if wanted[0] < 0:
+        raise ValueError(f"positions must be >= 0, got {wanted[0]}")
+    reference = list(reference_tokens)
+    if wanted[-1] > len(reference):
+        raise ValueError(
+            f"position {wanted[-1]} is beyond the {len(reference)}-token "
+            f"reference: there is no prefix to replay")
+
     ids = inputs["input_ids"]
-    prefix = list(prefix_token_ids)
     step = dict(inputs)
     if "attention_mask" in step:
         step["attention_mask"] = torch.ones_like(ids)
     step["use_cache"] = True
+    rows: dict[int, list[float]] = {}
     with torch.inference_mode():
         out = model(**step)
         past = getattr(out, "past_key_values", None)
-        row = out.logits[0, -1]
         attn = step.get("attention_mask")
-        for token in prefix:
+        consumed = 0
+        if consumed in wanted:
+            rows[consumed] = out.logits[0, -1].float().tolist()
+        for token in reference[:wanted[-1]]:
             if past is None:
                 raise RuntimeError(
                     "model returned no KV cache: the decode path cannot be "
@@ -520,41 +842,71 @@ def decode_logit_row(model: Any, inputs: dict, prefix_token_ids) -> list[float]:
                 kw["attention_mask"] = attn
             out = model(**kw)
             past = getattr(out, "past_key_values", None)
-            row = out.logits[0, -1]
-    return row.float().tolist()
+            consumed += 1
+            if consumed in wanted:
+                rows[consumed] = out.logits[0, -1].float().tolist()
+    return rows
 
 
-def adjudicate_generation(model: Any, inputs: dict, reference, candidate, *,
-                          epsilon: float = EPSILON_DEFAULT) -> Adjudication:
-    """Adjudicate the first token disagreement between two generations.
+def decode_logit_row(model: Any, inputs: dict, prefix_token_ids) -> list[float]:
+    """Incremental-decode row for the position after ``prefix_token_ids``.
 
-    Finds the first mismatching position, measures the logit row there on
-    BOTH paths, and applies Rules A and B.  The prefill row is required;
-    if the decode replay fails (older cache API, model without a cache,
-    OOM, ...) the failure is recorded in ``notes`` and the verdict falls
-    back to the single-path prefill rule — which is exactly the previous,
-    weaker behaviour, never a stronger claim.
+    One-position convenience wrapper over :func:`decode_logit_rows`.
+    """
+    prefix = list(prefix_token_ids)
+    return decode_logit_rows(model, inputs, prefix, [len(prefix)])[len(prefix)]
 
-    Requires an actual token mismatch: identical sequences and pure
-    length differences have no disputed logit row and raise
+
+def adjudicate_generation(
+        model: Any, inputs: dict, reference, candidate, *,
+        epsilon: float = EPSILON_DEFAULT,
+        budget: int = POSITION_BUDGET_DEFAULT,
+        max_disagreement_fraction: float = DISAGREEMENT_FRACTION_DEFAULT,
+) -> GenerationVerdict:
+    """Adjudicate a whole generation: Rules A, B and C end to end.
+
+    Censuses every disagreeing position, selects a bounded deterministic
+    sample of them (:func:`select_positions`), measures each sampled
+    position's logit row on BOTH the prefill and the decode path — the
+    decode rows all come from one shared replay — and aggregates the
+    per-position verdicts conservatively (:func:`aggregate_positions`).
+
+    The prefill rows are required.  If the decode replay fails (older
+    cache API, model without a cache, OOM, ...) the failure is recorded
+    in ``notes`` and every position falls back to the single-path prefill
+    rule — the previous, weaker behaviour, never a stronger claim.
+
+    Requires at least one token disagreement: identical sequences and
+    pure length differences have no disputed logit row and raise
     ``ValueError`` (call :func:`first_divergence` first).
     """
-    div = first_divergence(reference, candidate)
-    if not div.adjudicable:
+    ref = list(reference)
+    cand = list(candidate)
+    disagreeing = divergence_positions(ref, cand)
+    if not disagreeing:
         raise ValueError(
-            f"nothing to adjudicate: {div.reason}")
+            f"nothing to adjudicate: {first_divergence(ref, cand).reason}")
 
-    prefix = list(reference)[:div.position]
+    examined = select_positions(disagreeing, budget=budget)
     notes: list[str] = []
-    prefill_row = prefill_logit_row(model, inputs, prefix)
-    decode_row = None
+    decode_rows: dict[int, list[float]] = {}
     try:
-        decode_row = decode_logit_row(model, inputs, prefix)
+        decode_rows = decode_logit_rows(model, inputs, ref, examined)
     except Exception as exc:                                   # noqa: BLE001
         notes.append(
             f"decode-path replay unavailable ({type(exc).__name__}: {exc}); "
             f"the verdict rests on the prefill path alone")
-    return adjudicate(
-        div.reference_token, div.candidate_token,
-        prefill_logits=prefill_row, decode_logits=decode_row,
-        epsilon=epsilon, position=div.position, notes=tuple(notes))
+
+    per_position = []
+    for pos in examined:
+        prefill_row = prefill_logit_row(model, inputs, ref[:pos])
+        per_position.append(adjudicate(
+            ref[pos], cand[pos], prefill_logits=prefill_row,
+            decode_logits=decode_rows.get(pos), epsilon=epsilon,
+            position=pos))
+    return aggregate_positions(
+        per_position, positions_compared=min(len(ref), len(cand)),
+        positions_disagreeing=len(disagreeing), epsilon=epsilon,
+        max_disagreement_fraction=max_disagreement_fraction,
+        reference_length=len(ref), candidate_length=len(cand),
+        notes=tuple(notes))

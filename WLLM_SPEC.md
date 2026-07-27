@@ -166,13 +166,37 @@ WM(action-to-first-state/rollout steps/s/branch 吞吐) · WAM(o→a p50-95-99/d
      不同结论。两条 logit 行都可得时，**只有二者结论相同才作数；不一致一律判
      `undecidable`**（携带两组 gap 作证据），绝不静默放行——"换一种测法就变卦的 tie"
      从来没有被证明是 tie。
+   - *整段生成的保守聚合*（M27-D 增补）：上面两条只裁决**一个**位置，而真实生成常在很多位置
+     分歧（实测一次 MoE 运行 256 个位置里 227 个不同），只看第一个位置得出的整段结论**不成立**
+     ——首位置可以是 tie 而后面某个位置是决定性发散。因此：
+     - 取**有界、确定性**的位置样本（`select_positions`：**首 + 尾 + 其间等距展开**，默认预算
+       8 个位置）。首位置必取（唯一不受前缀分叉污染、证据最强）；尾位置必取（发散沿生成累积，
+       只看头部会系统性漏检）；中段等距展开保证样本可由输入复现，谁都无权挑选看哪些位置。
+     - **保守聚合**：任一被检位置为 `real_divergence` → 整段 `real_divergence`；否则任一为
+       `undecidable` → `undecidable`；**仅当每个被检位置都 benign** 才 `benign_tie`。
+     - **未检查的位置永不视为 benign**：未检查数量必须写进 reason，让读者看见残余风险而不是
+       从"通过"反推安全。
+     - 另有两条整段级封顶（单个位置的 gap 看不见的事实）：① **分歧比例**超过
+       `max_disagreement_fraction`（默认 5%）时，最好结论封顶为 `undecidable`——知识点是
+       tie 是 ~15 万词表里两个 logit 撞在 ε 内的稀有巧合，大比例分歧更可能是数值体系系统性
+       不同、且序列已经分叉，属**轨迹现象**（法则 1 的逻辑用于 AR 解码）而非刀锋。该阈值是
+       **写明的约定而非拟合常数**（历史通过案例 0.8%，本次被拒 MoE 支路 19–89%，两侧余量都很大）；
+       且仅在分歧位置 **> 1** 时生效——单个 flip 按定义就是刀锋，短序列不应仅因短而被拒。
+       ② **长度不同**（候选吐出的 token 数不同）同样封顶为 `undecidable`：停在别处就不是逐 token 精确。
+     - **已声明的适用边界**：首位置之后的裁决是拿**参考前缀** teacher-force 的——序列一旦分叉，
+       候选自身的条件就不同了，所以那些位置是**反事实检查**：能否决候选，但不能单独证明候选
+       实际轨迹最优。此不对称正是分歧比例封顶存在的理由，并写入结果的 `notes`。
    - `undecidable` 是与 `real_divergence` 并列的**一等结论**：它说的是"本次测量什么都
-     证明不了"，调用方必须按拒绝处理。输入缺失/退化（空 logit 行、越界 token id、非有限值）
-     一律 raise 或 `undecidable`，**永远不会是 `benign_tie`**。
+     证明不了"，调用方必须按拒绝处理。输入缺失/退化（空 logit 行、越界 token id、非有限值、
+     位置越界、无任何被检位置）一律 raise 或 `undecidable`，**永远不会是 `benign_tie`**。
    - 实现：`wllm/verify/adjudicate.py`——决策核心零后端依赖（纯 python/numpy，CPU 可单测），
-     torch 只在模型适配器内**惰性导入**；适配器同时产出 prefill 与 decode 两行 logit。
+     torch 只在模型适配器内**惰性导入**；适配器同时产出 prefill 与 decode 两行 logit，且样本内
+     所有 decode 行由**一次共享增量重放**得到（成本 `budget + max(pos)` 次前向，而非 `sum(pos)`）。
      测试 `tests/test_adjudicate.py`，纳入 coverage 与 mutation 双门控。
      **benchmark 不得再内联自己的裁决判据**（`benchmarks/baseline_qwen3vl.py` 已改为调用本模块）。
+   - 现场战果（job 202214，Qwen3-Omni-30B-A3B thinker）：`static_kv_cache` n=256 支路在旧的
+     "prefill 单路 + 单位置"判据下会被判 exact 并晋升为 **4.32×**；双路规则测出 decode 路径为
+     `real_divergence` → 判 `undecidable` 拒绝。**规则上线首次实战即拦下一个假通过。**
 3. **reference = ckpt 声明精度**——把 bf16 存储的权重上采到 fp32 得到的是变体，不是 oracle。
 4. **batching 改变数值结果，但分布可以不变**——两件事必须分别量化，不能互相代替。
 

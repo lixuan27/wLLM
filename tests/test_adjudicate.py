@@ -19,10 +19,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from wllm.verify.adjudicate import (
-    BENIGN_TIE, EPSILON_DEFAULT, IDENTICAL, LENGTH_MISMATCH, PATH_DECODE,
-    PATH_PREFILL, REAL_DIVERGENCE, TOKEN_MISMATCH, UNDECIDABLE, Adjudication,
-    PathEvidence, adjudicate, adjudicate_generation, adjudicate_row,
-    decode_logit_row, first_divergence, prefill_logit_row,
+    BENIGN_TIE, DISAGREEMENT_FRACTION_DEFAULT, EPSILON_DEFAULT, IDENTICAL,
+    LENGTH_MISMATCH, PATH_DECODE, PATH_PREFILL, POSITION_BUDGET_DEFAULT,
+    REAL_DIVERGENCE, TOKEN_MISMATCH, UNDECIDABLE, Adjudication, PathEvidence,
+    adjudicate, adjudicate_generation, adjudicate_row, aggregate_positions,
+    decode_logit_row, decode_logit_rows, divergence_positions,
+    first_divergence, prefill_logit_row, select_positions,
 )
 
 ADJUDICATE_PY = ROOT / "wllm" / "verify" / "adjudicate.py"
@@ -326,6 +328,189 @@ def test_token_mismatch_wins_over_length_mismatch():
     assert d.kind == TOKEN_MISMATCH and d.position == 1
 
 
+# ------------------------------------------------- rule C: whole generation
+
+def _pos(position, verdict):
+    """A per-position Adjudication with a given verdict, built directly."""
+    rows = {BENIGN_TIE: ([4.0, 4.0], [4.0, 4.0]),
+            REAL_DIVERGENCE: ([4.0, 1.0], [4.0, 1.0]),
+            UNDECIDABLE: ([4.0, 4.0], [4.0, 1.0])}[verdict]
+    res = adjudicate(0, 1, prefill_logits=rows[0], decode_logits=rows[1],
+                     position=position)
+    assert res.verdict == verdict            # the fixture itself is checked
+    return res
+
+
+def _agg(adjudications, compared, disagreeing, **over):
+    kw = {"positions_compared": compared, "positions_disagreeing": disagreeing,
+          "reference_length": compared, "candidate_length": compared}
+    kw.update(over)
+    return aggregate_positions(adjudications, **kw)
+
+
+def test_divergence_positions_censuses_every_disagreement():
+    assert divergence_positions([1, 2, 3, 4], [1, 9, 3, 8]) == (1, 3)
+    assert divergence_positions([1, 2, 3], [1, 2, 3]) == ()
+    # only the shared prefix is compared; a length difference is not a
+    # token disagreement
+    assert divergence_positions([1, 2, 3], [1, 5]) == (1,)
+    assert divergence_positions([], [1, 2]) == ()
+    assert divergence_positions([4, 4], [5, 5]) == (0, 1)
+
+
+def test_select_positions_takes_first_last_and_a_deterministic_spread():
+    picked = select_positions(range(20), budget=8)
+    assert len(picked) == 8
+    assert picked[0] == 0 and picked[-1] == 19       # first and last always
+    assert list(picked) == sorted(set(picked))       # ordered, deduplicated
+    assert select_positions(range(20), budget=8) == picked   # deterministic
+    # a different budget gives a different, still-anchored sample
+    small = select_positions(range(20), budget=3)
+    assert small[0] == 0 and small[-1] == 19 and len(small) == 3
+
+
+def test_select_positions_budget_boundary():
+    # budget at or above the number of disagreements examines all of them
+    assert select_positions([3, 7, 11], budget=3) == (3, 7, 11)
+    assert select_positions([3, 7, 11], budget=8) == (3, 7, 11)
+    assert select_positions([4, 9], budget=8) == (4, 9)
+    # budget 1 keeps the single unconfounded position
+    assert select_positions([3, 7, 11], budget=1) == (3,)
+    # one below the count starts dropping the middle, never the ends
+    trimmed = select_positions([3, 7, 11], budget=2)
+    assert trimmed == (3, 11)
+    assert select_positions([], budget=8) == ()
+    _raises(lambda: select_positions([1, 2], budget=0), "budget must be >= 1")
+    _raises(lambda: select_positions([1, 2], budget=-3), "budget must be >= 1")
+
+
+def test_aggregate_refuses_when_a_later_position_diverges():
+    """A benign first position must never carry a divergent later one."""
+    res = _agg([_pos(0, BENIGN_TIE), _pos(40, REAL_DIVERGENCE)], 100, 2)
+    assert res.verdict == REAL_DIVERGENCE and res.is_benign is False
+    assert res.positions_examined == (0, 40)
+    deciding = res.reason.split("deciding evidence: ")[1]
+    assert "pos 40" in deciding and "pos 0" not in deciding
+
+
+def test_aggregate_passes_only_when_every_examined_position_is_benign():
+    res = _agg([_pos(0, BENIGN_TIE), _pos(40, BENIGN_TIE)], 100, 2)
+    assert res.verdict == BENIGN_TIE and res.is_benign is True
+
+
+def test_aggregate_precedence_is_conservative():
+    """real_divergence beats undecidable beats benign_tie, in both orders."""
+    assert _agg([_pos(0, UNDECIDABLE), _pos(9, BENIGN_TIE)],
+                100, 2).verdict == UNDECIDABLE
+    assert _agg([_pos(0, BENIGN_TIE), _pos(9, UNDECIDABLE)],
+                100, 2).verdict == UNDECIDABLE
+    assert _agg([_pos(0, UNDECIDABLE), _pos(9, REAL_DIVERGENCE)],
+                100, 2).verdict == REAL_DIVERGENCE
+    assert _agg([_pos(0, REAL_DIVERGENCE), _pos(9, UNDECIDABLE)],
+                100, 2).verdict == REAL_DIVERGENCE
+    # a divergence is NOT softened to undecidable by a high fraction
+    hot = _agg([_pos(0, REAL_DIVERGENCE), _pos(9, BENIGN_TIE)], 10, 10)
+    assert hot.verdict == REAL_DIVERGENCE
+
+
+def test_aggregate_reports_unexamined_positions_as_residual_risk():
+    res = _agg([_pos(0, BENIGN_TIE), _pos(226, BENIGN_TIE)], 256, 227,
+               max_disagreement_fraction=1.0)
+    assert res.positions_unexamined == 225
+    assert "225 disagreeing positions were NOT examined" in res.reason
+    assert "NOT certified benign" in res.reason
+    assert "examined 2 of 227 disagreeing positions" in res.reason
+    assert res.as_dict()["positions_unexamined"] == 225
+
+
+def test_aggregate_caps_a_high_disagreement_fraction():
+    """227 of 256 positions differing is not a knife-edge phenomenon."""
+    field_case = [_pos(0, BENIGN_TIE), _pos(226, BENIGN_TIE)]
+    capped = _agg(field_case, 256, 227)                  # 88.7% >> 5%
+    assert capped.verdict == UNDECIDABLE and capped.is_benign is False
+    assert "trajectory phenomenon, not a knife edge" in capped.reason
+    assert abs(capped.disagreement_fraction - 227 / 256) < 1e-12
+    # the same evidence under a low fraction passes
+    calm = _agg(field_case, 4000, 2)                     # 0.05% << 5%
+    assert calm.verdict == BENIGN_TIE
+    # the threshold is an explicit parameter, testable from both sides
+    near = [_pos(0, BENIGN_TIE), _pos(9, BENIGN_TIE)]
+    assert _agg(near, 100, 5).verdict == BENIGN_TIE                # 5% <= 5%
+    assert _agg(near, 100, 6).verdict == UNDECIDABLE               # 6% > 5%
+    assert _agg(near, 100, 6,
+                max_disagreement_fraction=0.10).verdict == BENIGN_TIE
+    assert _agg(near, 100, 5,
+                max_disagreement_fraction=0.01).verdict == UNDECIDABLE
+    assert DISAGREEMENT_FRACTION_DEFAULT == 0.05
+
+
+def test_fraction_cap_needs_more_than_one_disagreement():
+    """A single flip is a knife edge by construction, however short the run."""
+    lone = _agg([_pos(0, BENIGN_TIE)], 1, 1)             # 100% of 1 position
+    assert lone.verdict == BENIGN_TIE
+    assert _agg([_pos(0, BENIGN_TIE)], 128, 1).verdict == BENIGN_TIE
+    # two is where "many positions disagree" starts to mean something
+    assert _agg([_pos(0, BENIGN_TIE), _pos(1, BENIGN_TIE)],
+                2, 2).verdict == UNDECIDABLE
+
+
+def test_aggregate_caps_a_length_difference():
+    ok = _agg([_pos(0, BENIGN_TIE)], 128, 1)
+    assert ok.verdict == BENIGN_TIE
+    short = _agg([_pos(0, BENIGN_TIE)], 128, 1, candidate_length=140)
+    assert short.verdict == UNDECIDABLE
+    assert "different token counts" in short.reason
+    assert short.as_dict()["candidate_length"] == 140
+
+
+def test_counterfactual_caveat_is_disclosed_when_it_applies():
+    one = _agg([_pos(0, BENIGN_TIE)], 128, 1)
+    assert one.notes == ()
+    many = _agg([_pos(0, BENIGN_TIE), _pos(9, BENIGN_TIE)], 100, 2,
+                max_disagreement_fraction=1.0)
+    assert len(many.notes) == 1
+    assert "REFERENCE" in many.notes[0]
+    carried = _agg([_pos(0, BENIGN_TIE), _pos(9, BENIGN_TIE)], 100, 2,
+                   max_disagreement_fraction=1.0, notes=("decode degraded",))
+    assert carried.notes[0] == "decode degraded"
+    assert len(carried.notes) == 2
+
+
+def test_aggregate_fails_closed_on_impossible_censuses():
+    good = _pos(0, BENIGN_TIE)
+    _raises(lambda: _agg([], 100, 1), "at least one measured position")
+    _raises(lambda: _agg([good], 0, 0), "positions_compared must be >= 1")
+    _raises(lambda: _agg([good], 10, 11), "exceeds")
+    _raises(lambda: _agg([good, _pos(1, BENIGN_TIE)], 10, 1),
+            "examined 2 positions but only 1 disagree")
+    _raises(lambda: _agg([adjudicate(0, 1, prefill_logits=[4.0, 4.0])], 10, 1),
+            "must carry its index")
+    _raises(lambda: _agg([_pos(50, BENIGN_TIE)], 10, 1),
+            "outside the 10 compared positions")
+    for bad in (-0.01, 1.5, float("nan"), float("inf")):
+        _raises(lambda bad=bad: _agg([good], 10, 1,
+                                     max_disagreement_fraction=bad),
+                "max_disagreement_fraction")
+    _raises(lambda: _agg([good], 10, 1, max_disagreement_fraction="most"),
+            "must be a number")
+    _raises(lambda: _agg([good], 10, 1, epsilon=-1.0), ">= 0")
+
+
+def test_generation_verdict_serialises_for_receipts():
+    res = _agg([_pos(0, BENIGN_TIE), _pos(226, REAL_DIVERGENCE)], 256, 227)
+    blob = json.loads(json.dumps(res.as_dict()))
+    assert blob["verdict"] == REAL_DIVERGENCE
+    assert blob["positions_compared"] == 256
+    assert blob["positions_disagreeing"] == 227
+    assert blob["positions_examined"] == [0, 226]
+    assert blob["positions_unexamined"] == 225
+    assert blob["max_disagreement_fraction"] == 0.05
+    assert len(blob["per_position"]) == 2
+    assert blob["per_position"][1]["position"] == 226
+    assert res.summary().startswith("[adjudicate] generation -> ")
+    assert "225 unexamined" in res.summary()
+
+
 # ------------------------------------------------------------- receipt shape
 
 def test_results_serialise_for_receipts():
@@ -371,9 +556,12 @@ def test_result_types_are_immutable():
     ev = adjudicate_row([4.0, 1.0], 0, 1)
     res = adjudicate(0, 1, prefill_logits=[4.0, 1.0])
     div = first_divergence([1], [2])
+    gen = _agg([_pos(0, REAL_DIVERGENCE)], 8, 1)
     assert ev.verdict == REAL_DIVERGENCE and res.verdict == REAL_DIVERGENCE
+    assert gen.verdict == REAL_DIVERGENCE
     for obj, attr in ((ev, "verdict"), (res, "verdict"), (div, "kind"),
-                      (res, "epsilon")):
+                      (res, "epsilon"), (gen, "verdict"),
+                      (gen, "positions_disagreeing")):
         try:
             setattr(obj, attr, BENIGN_TIE)
         except AttributeError:
@@ -424,9 +612,12 @@ def test_adjudicate_generation_refuses_when_there_is_nothing_to_judge():
             "nothing to adjudicate", "lengths differ")
 
 
-def test_default_epsilon_is_the_documented_constant():
+def test_defaults_are_the_documented_constants():
     assert EPSILON_DEFAULT == 1e-3
     assert math.isfinite(EPSILON_DEFAULT) and EPSILON_DEFAULT > 0
+    assert POSITION_BUDGET_DEFAULT == 8
+    assert DISAGREEMENT_FRACTION_DEFAULT == 0.05
+    assert 0.0 <= DISAGREEMENT_FRACTION_DEFAULT <= 1.0
 
 
 # ------------------------------------------------- model adapters (no GPU)
@@ -591,20 +782,54 @@ def _tie_row(hot, vocab=10):
     return [5.0 if i in hot else 0.0 for i in range(vocab)]
 
 
+def test_decode_rows_for_many_positions_come_from_one_replay():
+    """Cost is 1 + max(position) forwards, not sum(position)."""
+    scripted = [_tie_row({i}) for i in range(6)]
+    model = _StubModel(scripted)
+    with _stub_torch():
+        rows = decode_logit_rows(model, _stub_inputs(), [1, 2, 3, 4, 5],
+                                 [0, 2, 4])
+    assert sorted(rows) == [0, 2, 4]
+    assert len(model.calls) == 5               # prompt + 4 steps = 1 + max(4)
+    assert rows[0] == scripted[0]              # prompt forward
+    assert rows[2] == scripted[2]              # after consuming 2 tokens
+    assert rows[4] == scripted[4]
+    # duplicate / unsorted requests are normalised, not re-measured
+    again = _StubModel(scripted)
+    with _stub_torch():
+        rows2 = decode_logit_rows(again, _stub_inputs(), [1, 2, 3, 4, 5],
+                                  [4, 0, 4, 2])
+    assert sorted(rows2) == [0, 2, 4] and len(again.calls) == 5
+
+
+def test_decode_rows_fail_closed_on_impossible_requests():
+    model = _StubModel([_tie_row({1})])
+    with _stub_torch():
+        _raises(lambda: decode_logit_rows(model, _stub_inputs(), [1, 2], []),
+                "no positions requested")
+        _raises(lambda: decode_logit_rows(model, _stub_inputs(), [1, 2], [-1]),
+                "must be >= 0")
+        _raises(lambda: decode_logit_rows(model, _stub_inputs(), [1, 2], [9]),
+                "beyond the 2-token reference")
+
+
 def test_generation_adapter_measures_both_paths():
     """prefill says tie, decode says divergence -> undecidable, not a pass."""
-    model = _StubModel([_tie_row({9, 4}),      # call 1: prefill (tie)
-                        _tie_row({9}),         # call 2: decode prompt
-                        _tie_row({9})])        # call 3: decode step (diverge)
+    model = _StubModel([_tie_row({9}),         # call 1: decode prompt
+                        _tie_row({9}),         # call 2: decode @1 (diverge)
+                        _tie_row({9, 4})])     # call 3: prefill @1 (tie)
     with _stub_torch():
         res = adjudicate_generation(model, _stub_inputs(), [7, 9], [7, 4])
-    assert res.position == 1
-    assert res.paths == (PATH_PREFILL, PATH_DECODE)
-    assert res.evidence[PATH_PREFILL].verdict == BENIGN_TIE
-    assert res.evidence[PATH_DECODE].verdict == REAL_DIVERGENCE
+    assert res.positions_examined == (1,)
+    assert res.positions_disagreeing == 1 and res.positions_compared == 2
+    only = res.per_position[0]
+    assert only.paths == (PATH_PREFILL, PATH_DECODE)
+    assert only.evidence[PATH_PREFILL].verdict == BENIGN_TIE
+    assert only.evidence[PATH_DECODE].verdict == REAL_DIVERGENCE
+    assert only.verdict == UNDECIDABLE
     assert res.verdict == UNDECIDABLE and res.is_benign is False
-    assert res.notes == ()
-    assert len(model.calls) == 3               # 1 prefill + (prompt + 1 step)
+    assert res.notes == ()                     # single disagreement: no caveat
+    assert len(model.calls) == 3               # (prompt + 1 step) + 1 prefill
 
 
 def test_generation_adapter_degrades_to_single_path_with_a_note():
@@ -612,12 +837,89 @@ def test_generation_adapter_degrades_to_single_path_with_a_note():
     model = _StubModel([_tie_row({9, 4})], cache=False)
     with _stub_torch():
         res = adjudicate_generation(model, _stub_inputs(), [7, 9], [7, 4])
-    assert res.paths == (PATH_PREFILL,)
+    assert res.per_position[0].paths == (PATH_PREFILL,)
     assert res.verdict == BENIGN_TIE           # the old, weaker behaviour
     assert len(res.notes) == 1
     assert "decode-path replay unavailable" in res.notes[0]
     assert "RuntimeError" in res.notes[0]
     assert res.as_dict()["notes"] == list(res.notes)
+
+
+def test_generation_adapter_refuses_when_a_later_position_diverges():
+    """THE regression test: a benign first position must not carry the day.
+
+    Rule C end to end through the adapters.  Position 1 is a perfect tie;
+    position 3 is a decisive divergence.  The old single-position gate
+    returned ``benign_tie`` here and promoted the plan.
+    """
+    model = _StubModel([
+        _tie_row({0}),          # 1: decode prompt (pos 0, unused)
+        _tie_row({9, 4}),       # 2: decode @1  -> tie
+        _tie_row({0}),          # 3: decode @2  (agrees, not examined)
+        _tie_row({5}),          # 4: decode @3  -> divergence
+        _tie_row({9, 4}),       # 5: prefill @1 -> tie
+        _tie_row({5}),          # 6: prefill @3 -> divergence
+    ])
+    with _stub_torch():
+        res = adjudicate_generation(
+            model, _stub_inputs(), [7, 9, 3, 5], [7, 4, 3, 8],
+            max_disagreement_fraction=1.0)     # isolate Rule C aggregation
+    assert len(model.calls) == 6               # (prompt + 3 steps) + 2 prefills
+    assert res.positions_examined == (1, 3)
+    assert res.positions_disagreeing == 2 and res.positions_unexamined == 0
+    assert res.per_position[0].verdict == BENIGN_TIE
+    assert res.per_position[1].verdict == REAL_DIVERGENCE
+    assert res.verdict == REAL_DIVERGENCE and res.is_benign is False
+    # the counterfactual caveat is disclosed once more than one position
+    # disagrees, and the deciding evidence names the divergent position
+    assert any("REFERENCE" in n for n in res.notes)
+    deciding = res.reason.split("deciding evidence: ")[1]
+    assert "pos 3" in deciding and "pos 1" not in deciding
+
+
+def test_generation_adapter_passes_when_every_examined_position_is_benign():
+    model = _StubModel([_tie_row({0}), _tie_row({9, 4}), _tie_row({0}),
+                        _tie_row({5, 8}), _tie_row({9, 4}), _tie_row({5, 8})])
+    with _stub_torch():
+        res = adjudicate_generation(
+            model, _stub_inputs(), [7, 9, 3, 5], [7, 4, 3, 8],
+            max_disagreement_fraction=1.0)
+    assert res.verdict == BENIGN_TIE and res.is_benign is True
+    assert res.positions_examined == (1, 3)
+
+
+def test_generation_adapter_honours_the_position_budget():
+    """Bounded work: only the sampled positions are measured, and the rest
+    are counted as unexamined rather than assumed benign."""
+    model = _StubModel([
+        _tie_row({1, 9}),       # 1: decode prompt = pos 0 -> tie
+        _tie_row({0}),          # 2: decode @1 (not sampled)
+        _tie_row({0}),          # 3: decode @2 (not sampled)
+        _tie_row({0}),          # 4: decode @3 (not sampled)
+        _tie_row({5, 9}),       # 5: decode @4 -> tie
+        _tie_row({1, 9}),       # 6: prefill @0
+        _tie_row({5, 9}),       # 7: prefill @4
+    ])
+    with _stub_torch():
+        res = adjudicate_generation(
+            model, _stub_inputs(), [1, 2, 3, 4, 5], [9, 9, 9, 9, 9],
+            budget=2, max_disagreement_fraction=1.0)
+    assert res.positions_disagreeing == 5
+    assert res.positions_examined == (0, 4)      # first and last
+    assert res.positions_unexamined == 3
+    assert len(model.calls) == 7                 # (1 + 4) replay + 2 prefills
+    assert res.verdict == BENIGN_TIE
+    assert "3 disagreeing positions were NOT examined" in res.reason
+
+
+def test_generation_adapter_handles_a_divergence_at_position_zero():
+    model = _StubModel([_tie_row({9, 4}),      # 1: decode prompt = pos 0
+                        _tie_row({9, 4})])     # 2: prefill @0
+    with _stub_torch():
+        res = adjudicate_generation(model, _stub_inputs(), [9], [4])
+    assert res.positions_examined == (0,)
+    assert len(model.calls) == 2                # prompt only, no decode steps
+    assert res.verdict == BENIGN_TIE
 
 
 if __name__ == "__main__":

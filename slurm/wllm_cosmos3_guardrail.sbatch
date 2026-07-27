@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=wllm_cosmos3_guardrail
+#SBATCH --job-name=wllm_cosmos3_guardrail_retry1
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -14,6 +14,21 @@
 # record the guardrail-enabled configuration as the honest baseline.
 # The onboarding smoke's BLOCKER path is untouched; this job is the
 # other arm, and it fails closed if the weights are not loadable.
+#
+# retry1 root cause (job 202227, FAILED 00:02:49): the guardrail repo's
+# refs/main had been written with a trailing newline (41 bytes, not
+# 40). huggingface_hub resolves an offline revision with a verbatim
+# f.read() and no strip, so snapshot_download looked for
+# snapshots/<sha>\n and raised LocalEntryNotFoundError inside
+# CosmosSafetyChecker() -- after a 28s pipeline load and a 56s warmup.
+# The readiness precheck stripped the ref and wrongly passed.
+# Changes since 202227: (a) the ref is rewritten to the canonical 40
+# bytes; (b) _resolve_revision now mirrors the loader byte-for-byte
+# (verbatim ref, no lone-snapshot fallback) and names the offending
+# repo/revision; (c) requirements cover every path
+# CosmosSafetyChecker.__init__ resolves, including the separate
+# Qwen3Guard repo; (d) the benchmark prints a full traceback on the
+# failure path instead of a bare one-line marker.
 
 set -uo pipefail
 echo "Job ID: $SLURM_JOB_ID"; echo "Node: $SLURM_NODELIST"; echo "Start: $(date)"

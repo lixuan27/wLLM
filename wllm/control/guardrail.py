@@ -73,24 +73,44 @@ def repo_dirname(repo_id: str) -> str:
     return "models--" + repo_id.replace("/", "--")
 
 
-def _pick_revision(repo_dir: Path) -> Path | None:
-    """Resolve the snapshot revision a loader would land on.
+def _resolve_revision(repo_dir: Path) -> tuple[Path | None, str]:
+    """Resolve the revision *exactly* as the hub loader does offline.
 
-    ``refs/main`` wins when it points at a real revision directory;
-    otherwise fall back to a lone snapshot directory.  Ambiguity with
-    no ref is not resolved by guessing — the caller gets a blocker.
+    ``huggingface_hub`` reads ``refs/<revision>`` verbatim — literally
+    ``f.read()``, with no ``strip()`` — and joins the result onto
+    ``snapshots/``.  A ref written with a trailing newline therefore
+    names a directory that cannot exist, and the loader dies with
+    ``LocalEntryNotFoundError``.  There is also no "lone snapshot"
+    fallback: without a readable ref the loader has no commit hash at
+    all and fails.
+
+    Reproducing both behaviours byte-for-byte is the entire point of
+    this function.  A precheck more forgiving than the loader is worse
+    than no precheck: it certifies a chain that then cannot construct,
+    converting a fast clear failure into an expensive opaque one.
+
+    Returns ``(revision_dir, blocker)``; exactly one is meaningful.
     """
     snaps = repo_dir / "snapshots"
     if not snaps.is_dir():
-        return None
-    revs = sorted(p for p in snaps.iterdir() if p.is_dir())
+        return None, f"no snapshots/ directory under {repo_dir}"
     ref = repo_dir / "refs" / "main"
-    if ref.is_file():
-        head = ref.read_text(encoding="utf-8", errors="replace").strip()
-        target = snaps / head
-        if target.is_dir():
-            return target
-    return revs[0] if len(revs) == 1 else None
+    if not ref.is_file():
+        return None, (f"no refs/main under {repo_dir}; the loader "
+                      f"resolves revisions through that file only and "
+                      f"has no lone-snapshot fallback")
+    raw = ref.read_text(encoding="utf-8", errors="replace")
+    if (snaps / raw).is_dir():
+        return snaps / raw, ""
+    stripped = raw.strip()
+    if stripped != raw and (snaps / stripped).is_dir():
+        return None, (
+            f"refs/main names revision {stripped!r} but the file holds "
+            f"{raw!r} — the loader reads the ref verbatim and will look "
+            f"for snapshots/{raw!r}, which cannot exist. Rewrite the "
+            f"ref with no trailing whitespace.")
+    return None, (f"refs/main names revision {stripped!r} but "
+                  f"{snaps / stripped} does not exist")
 
 
 def check_hf_cache(cache_root: str | Path,
@@ -118,12 +138,9 @@ def check_hf_cache(cache_root: str | Path,
         if not repo_dir.is_dir():
             blockers.append(f"missing repo in cache: {where}")
             continue
-        rev = _pick_revision(repo_dir)
+        rev, problem = _resolve_revision(repo_dir)
         if rev is None:
-            blockers.append(
-                f"{where}: no resolvable snapshot revision under "
-                f"{repo_dir / 'snapshots'} (no usable refs/main and not "
-                f"exactly one revision)")
+            blockers.append(f"{where}: {problem}")
             continue
         resolved[req.repo_id] = str(rev)
         for rel in req.relpaths:

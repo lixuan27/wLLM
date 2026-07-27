@@ -12,8 +12,8 @@ project promised: no blanket "supported".
 | 2 | `a34e683` | successive-halving search; substrate L0 adapter; first real baseline (video 5B) |
 | 3 | `6f41d77` | drift-gated optimization verdicts; negative results retained |
 | 4 | `85e4307` | both in-house engines unified (2370 files, mechanical rename, gate-enforced) |
-| 5 | `7f6505e` | VLM 2.75× with tie-aware exactness (argmax-tie proof) |
-| 6 | `5159846` | Alpha complete: 3 models, median 2.75× |
+| 5 | `7f6505e` | VLM 2.75× with tie-aware exactness (argmax-tie proof) — **withdrawn 2026-07-27, see correction below** |
+| 6 | `5159846` | Alpha complete: 3 models, median 2.75× — **one of the three is withdrawn** |
 | 7 | `28688f7` | integration import health 87%; rename-damage zero |
 | 8 | `dd87164` | bit-exact 1.74× denoise via CFG branch parallelism (2 GPU) |
 | 9 | `84fe425` | first E2E app launch (Launchable tier, 704 frames) |
@@ -26,8 +26,30 @@ project promised: no blanket "supported".
 |---|---|---|---|---|
 | Wan2.2-TI2V-5B | 5762 ms E2E | CFG branch-parallel, 2 GPU | **1.44× E2E, frame-level bit-exact** | exact (measured, job 196293) |
 | 〃 (single-GPU) | 5615 ms | compile max-autotune-no-cg | 1.43× | bounded-drift (refused by exact gate, documented) |
-| Qwen3-VL-8B | 2668 ms /128 tok | static KV cache | **2.75×** | tie-aware exact (argmax tie proven, gap=0.0) |
+| Qwen3-VL-8B | 2668 ms /128 tok | static KV cache | ~~**2.75×**~~ | ~~tie-aware exact~~ **WITHDRAWN 2026-07-27 — see correction** |
 | OpenVLA-7B | 133 ms /action (naive fp32) | native bf16 | **4.59×** | native-precision restoration (ckpt declares bf16) |
+
+> **Correction, 2026-07-27 (jobs 202244, 202214).** The Qwen3-VL row is
+> withdrawn. It was accepted under an adjudication rule that ruled on the
+> teacher-forced **prefill** path alone; the current rule also replays the
+> **decode** path and refuses when the two disagree. Re-verification could
+> not re-establish the claim, because the adjudicator crashes on this
+> model's multimodal path — so the status is **unproven, not disproven**,
+> and this project's rule is that no evidence is not a pass.
+>
+> Two findings from the same week explain why this matters beyond one row.
+> First, on a different model the strengthened rule caught a **4.32×** leg
+> that the old prefill-only rule would have promoted as exact: prefill
+> called it a benign tie, decode called it a real divergence. Second,
+> requesting a static cache on this runtime **silently also enables a
+> compiled forward**, so every leg labelled "static KV cache" has been
+> measuring a composition — and the observed drift is exactly one bf16
+> ULP, the signature of the fusion reordering that law 1 below already
+> classifies as bounded. The experiment that separates cache from compile
+> is running; until it lands, neither component is credited.
+>
+> The report body is left as originally written. A dated report edited to
+> agree with later knowledge is no longer evidence of what was known when.
 
 ## Verifier laws (the research core, each with disk evidence)
 

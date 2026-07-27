@@ -26,7 +26,9 @@ def _make_repo(root: Path, repo_id: str, rev: str = "abc123",
         p.write_text("x")
     if write_ref:
         (repo / "refs").mkdir(parents=True, exist_ok=True)
-        (repo / "refs" / "main").write_text(rev + "\n")
+        # No trailing newline: this is what `hf download` writes, and
+        # what the loader requires (it does not strip the ref).
+        (repo / "refs" / "main").write_text(rev)
     if extra_rev:
         (repo / "snapshots" / extra_rev).mkdir(parents=True, exist_ok=True)
     return repo
@@ -103,30 +105,52 @@ def test_refs_main_selects_the_revision_a_loader_would_use(tmp_path):
     assert rep.resolved["org/guard"].endswith("/good")
 
 
-def test_ambiguous_revision_without_ref_is_refused_not_guessed(tmp_path):
-    _make_repo(tmp_path, "org/guard", rev="r1", files=("a.txt",),
-               write_ref=False, extra_rev="r2")
-    rep = check_hf_cache(tmp_path, [CacheRequirement("org/guard",
-                                                     ("a.txt",))])
-    assert not rep.ready
-    assert any("no resolvable snapshot revision" in b
-               for b in rep.blockers)
-
-
-def test_single_revision_without_ref_still_resolves(tmp_path):
+def test_missing_ref_is_refused_even_with_one_revision(tmp_path):
+    # The loader resolves revisions through refs/main only; with no
+    # ref it has no commit hash and fails. A "helpful" lone-snapshot
+    # fallback here would certify a chain that cannot construct.
     _make_repo(tmp_path, "org/guard", rev="only", files=("a.txt",),
                write_ref=False)
     rep = check_hf_cache(tmp_path, [CacheRequirement("org/guard",
                                                      ("a.txt",))])
-    assert rep.ready
+    assert not rep.ready
+    assert any("no refs/main" in b for b in rep.blockers)
 
 
-def test_dangling_ref_falls_back_only_when_unambiguous(tmp_path):
+def test_dangling_ref_is_refused_and_names_the_revision(tmp_path):
     repo = _make_repo(tmp_path, "org/guard", rev="real", files=("a.txt",))
-    (repo / "refs" / "main").write_text("vanished\n")
+    (repo / "refs" / "main").write_text("vanished")
     rep = check_hf_cache(tmp_path, [CacheRequirement("org/guard",
                                                      ("a.txt",))])
-    assert rep.ready and rep.resolved["org/guard"].endswith("/real")
+    assert not rep.ready
+    assert any("'vanished'" in b for b in rep.blockers)
+
+
+def test_trailing_newline_in_ref_is_caught_and_explained(tmp_path):
+    # Regression: job 202227. hub reads refs/main verbatim (f.read(),
+    # no strip), so a ref written by `echo` names snapshots/<sha>\n,
+    # which cannot exist -> LocalEntryNotFoundError at construction.
+    # A precheck that strips would green-light this and burn a 28s
+    # pipeline load plus a 56s warmup before failing.
+    repo = _make_repo(tmp_path, "org/guard", rev="deadbeef",
+                      files=("a.txt",))
+    (repo / "refs" / "main").write_text("deadbeef\n")
+    rep = check_hf_cache(tmp_path, [CacheRequirement("org/guard",
+                                                     ("a.txt",))])
+    assert not rep.ready
+    blob = " ".join(rep.blockers)
+    assert "trailing whitespace" in blob
+    assert "'deadbeef\\n'" in blob or "deadbeef\\n" in blob
+
+
+def test_exact_ref_without_newline_resolves(tmp_path):
+    repo = _make_repo(tmp_path, "org/guard", rev="deadbeef",
+                      files=("a.txt",))
+    (repo / "refs" / "main").write_text("deadbeef")
+    rep = check_hf_cache(tmp_path, [CacheRequirement("org/guard",
+                                                     ("a.txt",))])
+    assert rep.ready
+    assert rep.resolved["org/guard"].endswith("/deadbeef")
 
 
 # --------------------------------------------------------- accounting

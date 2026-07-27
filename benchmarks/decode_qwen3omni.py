@@ -176,9 +176,27 @@ def main() -> int:  # noqa: C901 — one linear sweep, kept in one place
                 "adjudication": adj.as_dict()}
 
     # -------------------------------------------------- leg application
-    def apply_experts(name: str | None) -> str:
-        """Switch the routed-expert kernel and PROVE it took effect."""
-        want = base_experts if name is None else name
+    def apply_experts(name: str | None) -> str | None:
+        """Switch the routed-expert kernel and PROVE it took effect.
+
+        ``name is None`` means "restore the reference kernel". If this
+        build exposes no expert-kernel switch at all, restoring is a
+        no-op (there is nothing to undo) while *requesting* a specific
+        kernel is a hard failure -- silently timing the default kernel
+        under a candidate's name is exactly the fabrication this project
+        exists to prevent.
+        """
+        if name is None:
+            if base_experts is None:
+                return None
+            want = base_experts
+        else:
+            if base_experts is None:
+                raise RuntimeError(
+                    "this build exposes no routed-expert kernel switch "
+                    "(_experts_implementation is absent), so this pass "
+                    "cannot be applied, let alone measured")
+            want = name
         model.set_experts_implementation(want)
         got = getattr(text_cfg, "_experts_implementation", None)
         if got != want:

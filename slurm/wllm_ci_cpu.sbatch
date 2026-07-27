@@ -38,6 +38,7 @@ python -m coverage run -m pytest -q tests/test_control_plane.py tests/test_bdd_s
     tests/test_guardrail.py \
     tests/test_adjudicate.py tests/test_planner_toy.py \
     tests/test_step_cache_tensor.py tests/test_plugin_package.py \
+    tests/test_composite_rendezvous.py \
   && python -m coverage report --fail-under=85 | tee .wllm_coverage.txt || FAIL=1
 
 step "real-evidence receipt (wan22 CFG branch-parallel, job 196293)"
@@ -67,9 +68,14 @@ grep -q "reject wllm-serving:reuse_cache: quality=bounded" \
   || { echo "  layer 1: reuse_cache not refused under exact policy — FAIL"; \
        cat /tmp/wllm_cand_exact_$SLURM_JOB_ID.txt; FAIL=1; }
 $CAND --quality-policy bounded > /tmp/wllm_cand_b_$SLURM_JOB_ID.txt 2>&1
-grep -q "dropped pass 'reuse_cache'" /tmp/wllm_cand_b_$SLURM_JOB_ID.txt \
-  && grep -q "quality collapse" /tmp/wllm_cand_b_$SLURM_JOB_ID.txt \
-  && echo "  layer 2 (measured history): reuse_cache dropped citing its trace — PASS" \
+# Assert the mechanism (dropped, citing a trace), not one trace's prose:
+# a later measurement legitimately supersedes an earlier one by the
+# store's latest-wins rule, so pinning a specific reason string would
+# make this gate fail every time the evidence is refreshed — which is
+# the opposite of what it is here to protect.
+grep -qE "dropped pass 'reuse_cache': known-bad from trace [0-9a-f]+" \
+  /tmp/wllm_cand_b_$SLURM_JOB_ID.txt \
+  && echo "  layer 2 (measured history): reuse_cache dropped citing a trace — PASS" \
   || { echo "  layer 2: reuse_cache survived measured history — FAIL"; \
        cat /tmp/wllm_cand_b_$SLURM_JOB_ID.txt; FAIL=1; }
 

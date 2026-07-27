@@ -83,8 +83,28 @@ Model support is reported honestly in tiers —
 | Model | Best plan | Verdict |
 |---|---|---|
 | video 5B (TI2V) | CFG branch-parallel, 2 GPU | **1.44× E2E, frame-level bit-exact** |
-| VLM 8B | static KV cache | **2.75×**, tie-aware exact (top-2 logit gap = 0.0 proven) |
 | VLA 7B | native checkpoint precision | **4.59×** vs naive fp32 (the fp32 upcast was the variant, not the oracle) |
+| composite runtime, 64 concurrent rollout sessions | step batching | **3.27×**, per-session outputs bit-identical to running alone |
+| VLM 8B | static KV cache | ~~2.75×, tie-aware exact~~ — **withdrawn 2026-07-27**, see below |
+| omni 30B-A3B (MoE thinker) | — | **no exact win found**; the fastest candidate (4.3×) was refused |
+| video 5B (TI2V) | reuse cache | **refused**: 3.30× but the video collapsed (PSNR 11.6 dB) |
+
+Two entries above are refusals and one is a withdrawal. They are listed
+because a scorecard that only shows wins is not evidence of a working
+verifier — it is evidence of an untested one.
+
+**Withdrawal (2026-07-27).** The VLM static-KV claim was accepted under an
+earlier rule that adjudicated a disputed token on the teacher-forced
+prefill path alone. Under the current rule — ε-optimal set **and**
+prefill/decode consistency — it could not be re-established: the token
+mismatch is still there, and the adjudicator that would decide whether it
+is arbitration or divergence crashes on that model's multimodal path. The
+status is **unproven, not disproven**; no evidence is not a pass. A
+separate finding makes the withdrawal substantive rather than procedural:
+on this runtime, requesting a static cache silently also enables a
+compiled forward, so the original measurement was of a composition nobody
+had separated, and compiled diffusion/decode is already classified as
+*bounded* by measurement.
 
 ## Design principles
 

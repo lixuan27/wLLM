@@ -1,4 +1,24 @@
-# Qwen3-VL 8B — grounded in docs/BETA_REPORT.md measurements only.
+# Qwen3-VL 8B.
+#
+# WITHDRAWN CLAIM (2026-07-27, job 202244): this profile used to carry
+# static_kv_cache as a measured EXACT optimization at 2.75x. That claim
+# was granted under the older adjudication rule, which ruled on the
+# teacher-forced prefill path alone. Under the strengthened rule
+# (epsilon-optimal set AND prefill/decode consistency) it could not be
+# re-established: the greedy token mismatch is still there (position 43,
+# ref 3691 vs 6303), and the adjudicator that would decide whether that
+# mismatch is arbitration or divergence CRASHED on this model's
+# multimodal path (IndexError: attention mask of length 263 against an
+# indexed tensor of length 220 — the vision placeholder expansion
+# desynchronizes the decode replay's prefix).
+#
+# So the honest status is UNPROVEN, not DISPROVEN. The pass may well be
+# exact; there is simply no evidence for it now, and this project's rule
+# is that no evidence is not a pass. It stays out of the optimization
+# list until a working adjudicator rules on it. The rejection is
+# recorded in the trace store dated 2026-07-27, which supersedes the
+# 2026-07-24 acceptance by the store's latest-trace-wins rule rather
+# than by rewriting history.
 model_family: qwen3-vl
 detection_ids:
   - Qwen/Qwen3-VL-8B-Instruct
@@ -6,26 +26,28 @@ detection_ids:
 components: [vision_encoder, language_model]
 runtime_support:
   - runtime: wllm-serving
-    tier: optimized
+    tier: launchable
     evidence:
+      - {kind: job_log, ref: "job 202244",
+         note: "reference AR decode leg reproduces: 2683.5 ms for 128 new
+                tokens (47.7 tok/s) on 1xH200, load 63s. Tier is back to
+                launchable because no optimization currently holds a
+                verdict for this model"}
       - {kind: report, ref: "docs/BETA_REPORT.md",
-         note: "static KV cache 2.75x (2668 ms -> /128 tok baseline)"}
-optimizations_lossless:
-  - name: static_kv_cache
-    quality_class: exact
-    evidence:
-      - {kind: report, ref: "docs/BETA_REPORT.md",
-         note: "tie-aware exact: the single greedy flip sits at a top-2
-                logit gap of exactly 0.0 (arbitration, not divergence)"}
-    notes: "cross-numerics token gates must be tie-aware (verifier law 2)"
+         note: "HISTORICAL, superseded: static KV cache measured 2.75x
+                (2668 ms baseline) and was accepted as tie-aware exact
+                under the prefill-only rule; see the withdrawal note at
+                the top of this file"}
+optimizations_lossless: []   # withdrawn 2026-07-27, see header
+optimizations_bounded: []
 incompatibilities: []
 authenticity_signals:
   - kv_cache_active
 validation:
-  - token_parity_tie_aware
+  - token_parity_dual_path   # the gate the claim must now clear
 binding:
   backend_version: "0.0.1a0"
   hardware: 1xH200
   cuda: ""
-  last_validated: "2026-07-24"
+  last_validated: "2026-07-27"
   evidence_level: measured

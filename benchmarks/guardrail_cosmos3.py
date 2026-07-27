@@ -62,12 +62,21 @@ CACHE_ROOT = str(ROOT / "checkpoints" / "hf_guardrail_cache")
 # a blocklist + its nltk corpus, a face-blur postprocessor checkpoint,
 # and a separate small generative guard model for the prompt check.
 REQUIREMENTS = [
+    # Blocklist() reads these four directories through
+    # read_keyword_list_from_dir + nltk; RetinaFaceFilter() loads the
+    # single face-blur checkpoint. Both go through snapshot_download.
     CacheRequirement("nvidia/Cosmos-1.0-Guardrail",
-                     ("blocklist", "blocklist/nltk_data",
+                     ("blocklist/custom", "blocklist/exact_match",
+                      "blocklist/whitelist", "blocklist/nltk_data",
                       "face_blur_filter/Resnet50_Final.pth"),
                      note="blocklist + face-blur postprocessor"),
+    # Qwen3Guard() is a SEPARATE repo resolved by transformers, not by
+    # the guardrail checkpoint id — the prompt-side check cannot
+    # construct without it.
     CacheRequirement("Qwen/Qwen3Guard-Gen-0.6B",
-                     ("config.json",),
+                     ("config.json", "generation_config.json",
+                      "model.safetensors", "tokenizer.json",
+                      "tokenizer_config.json"),
                      note="prompt-side generative guard"),
 ]
 
@@ -388,6 +397,13 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as exc:  # noqa: BLE001 — explicit failure marker
+        # The one-line marker is for the sbatch grep; the traceback is
+        # for whoever has to diagnose it. A previous run lost the
+        # identity of a missing cache artifact to a bare exception
+        # string, so print both — never just the summary.
+        import traceback
         print(f"COSMOS3_GUARDRAIL_FAIL: {type(exc).__name__}: {exc}",
               flush=True)
+        traceback.print_exc()
+        sys.stdout.flush()
         raise SystemExit(1)

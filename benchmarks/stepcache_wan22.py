@@ -35,7 +35,13 @@ MODEL_DIR = "/public/home/lixuan/lixuan/pretrained-model/Wan2.2-TI2V-5B-Diffuser
 PROMPT = ("A red vintage car drives along a coastal road at sunset, "
           "waves crashing on the rocks, cinematic lighting.")
 NEG = "low quality, blurry, distorted"
-H, W, FRAMES, STEPS, SEED, CFG = 480, 832, 33, 20, 1234, 5.0
+H, W, FRAMES, SEED, CFG = 480, 832, 33, 1234, 5.0
+# Schedule length is the variable that decides whether this technique can
+# work at all: consecutive model evaluations are only redundant when the
+# schedule is fine enough that neighbouring steps ask nearly the same
+# question. Rounds 1-2 measured 20 steps and found no operating point;
+# the boundary is a schedule-length question, so the length is a knob.
+STEPS = int(os.environ.get("WLLM_STEPCACHE_STEPS", "20"))
 THRESHOLDS = [float(x) for x in
               os.environ.get("WLLM_STEPCACHE_TAUS", "0.05,0.10,0.20").split(",")]
 # (key, threshold, consecutive cap) triples.  Round 1 (job 202206) swept
