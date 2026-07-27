@@ -28,13 +28,16 @@ python -m pytest tests/ -q || FAIL=1
 step "BDD feature scenarios"
 python tests/test_bdd_scenarios.py || FAIL=1
 
-step "coverage gate (control plane + data-plane pillars >= 85%)"
+step "coverage gate (control plane + data-plane pillars + verifier >= 85%)"
 python -m coverage run -m pytest -q tests/test_control_plane.py tests/test_bdd_scenarios.py \
     tests/test_composite.py tests/test_techniques.py tests/test_omni_engine.py \
     tests/test_catalog_assets.py tests/test_evidence.py tests/test_mcp_server.py \
     tests/test_technique_composer.py tests/test_composite_lowering.py \
     tests/test_slo.py tests/test_profiles.py tests/test_tracestore.py \
     tests/test_candidates.py tests/test_composite_walks.py \
+    tests/test_guardrail.py \
+    tests/test_adjudicate.py tests/test_planner_toy.py \
+    tests/test_step_cache_tensor.py \
   && python -m coverage report --fail-under=85 | tee .wllm_coverage.txt || FAIL=1
 
 step "real-evidence receipt (wan22 CFG branch-parallel, job 196293)"

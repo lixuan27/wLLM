@@ -151,8 +151,30 @@ A 结构 → B 数值（fixed-seed latent/logits/action 容差；tie-aware token
 D 压力（动态 shape/长跑/队列溢出/session churn/OOM/crash）→ E 故障注入。
 指标族：MLLM(TTFT/inter-token/req/s/AV 同步) · Video(首帧/E2E FPS/p95 帧间隔/GPU-s per video) ·
 WM(action-to-first-state/rollout steps/s/branch 吞吐) · WAM(o→a p50-95-99/deadline miss/staleness/成功率)。
-已沉淀 Verifier Laws（BETA_REPORT）：编译扩散按轨迹发散须实证分类；tie 是仲裁不是发散；
-reference=ckpt 声明精度；batching 改变结果但分布可不变。
+
+**Verifier Laws（研究内核，逐条有落盘证据；来源 BETA_REPORT）**：
+
+1. **编译扩散按轨迹发散**——bf16 融合重排 × 多步去噪会放大成像素级漂移，
+   "exact" 必须按 (model, precision, loop depth) **实证分类**，不能按常识声明。
+2. **AR token 分歧可能是仲裁而非发散——而仲裁必须双路自洽**（本条在 M27 强化）：
+   - *ε-最优集判据*：取分歧位置的 logit 行，令 `m = max(row)`；当且仅当参考 token 与候选
+     token **两者都**落在 `[m-ε, m]`（默认 ε=1e-3）内，该分歧才算仲裁。此判据**刻意强于**
+     "二者恰好是 top-2 对"——现场出现过三路简并 tie（第三个 token 同样在最大值上），
+     top-2 判据恰好会把它误判为发散。ε-最优集大小随判决一起作为证据落盘。
+   - *prefill/decode 双路一致性*：teacher-forced **prefill**（整段一次前向）与真实生成走的带
+     KV cache 的增量 **decode** 路径在 bf16 下并非逐位相同，同一个刀锋位置两条路径可能给出
+     不同结论。两条 logit 行都可得时，**只有二者结论相同才作数；不一致一律判
+     `undecidable`**（携带两组 gap 作证据），绝不静默放行——"换一种测法就变卦的 tie"
+     从来没有被证明是 tie。
+   - `undecidable` 是与 `real_divergence` 并列的**一等结论**：它说的是"本次测量什么都
+     证明不了"，调用方必须按拒绝处理。输入缺失/退化（空 logit 行、越界 token id、非有限值）
+     一律 raise 或 `undecidable`，**永远不会是 `benign_tie`**。
+   - 实现：`wllm/verify/adjudicate.py`——决策核心零后端依赖（纯 python/numpy，CPU 可单测），
+     torch 只在模型适配器内**惰性导入**；适配器同时产出 prefill 与 decode 两行 logit。
+     测试 `tests/test_adjudicate.py`，纳入 coverage 与 mutation 双门控。
+     **benchmark 不得再内联自己的裁决判据**（`benchmarks/baseline_qwen3vl.py` 已改为调用本模块）。
+3. **reference = ckpt 声明精度**——把 bf16 存储的权重上采到 fp32 得到的是变体，不是 oracle。
+4. **batching 改变数值结果，但分布可以不变**——两件事必须分别量化，不能互相代替。
 
 ## 9. 质量工程（v2 新增强制）
 

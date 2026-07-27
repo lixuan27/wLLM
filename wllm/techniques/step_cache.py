@@ -40,6 +40,27 @@ def _norm(a: Vector) -> float:
     return math.sqrt(sum(x * x for x in a))
 
 
+def should_reuse(delta_norm: float, base_norm: float, threshold: float,
+                 consecutive: int, max_consecutive_reuses: int) -> bool:
+    """The one reuse rule, shared by every backend of this technique.
+
+    Both the torch-free reference implementation below and the tensor
+    implementation used on real deployments call this predicate, so a
+    simulated run and a hardware run can never drift apart on *when*
+    the cache engages — only on the numerics they engage over.
+
+    Non-finite norms (a diverged loop) never reuse: the cache must not
+    extrapolate a residual it cannot trust.
+    """
+    if threshold <= 0:
+        return False
+    if consecutive >= max_consecutive_reuses:
+        return False
+    if not math.isfinite(delta_norm) or not math.isfinite(base_norm):
+        return False
+    return delta_norm / (base_norm + 1e-12) < threshold
+
+
 @dataclass
 class StepResidualCache:
     """Wraps ``step_fn(x, k) -> x'`` with residual-reuse skipping."""
@@ -78,11 +99,10 @@ class StepResidualCache:
     def __call__(self, x: list[float], k: int) -> list[float]:
         self.steps_total += 1
         if (self.threshold > 0 and self._last_input is not None
-                and self._last_residual is not None
-                and self._consecutive < self.max_consecutive_reuses):
-            delta = _norm(_sub(x, self._last_input))
-            base = _norm(self._last_input) + 1e-12
-            if delta / base < self.threshold:
+                and self._last_residual is not None):
+            if should_reuse(_norm(_sub(x, self._last_input)),
+                            _norm(self._last_input), self.threshold,
+                            self._consecutive, self.max_consecutive_reuses):
                 self.steps_reused += 1
                 self._consecutive += 1
                 out = _add(x, self._last_residual)

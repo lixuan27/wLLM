@@ -1,13 +1,20 @@
 """Model #2: Qwen3-VL-8B-Instruct (MLLM / AR-decode archetype).
 
 Baseline + optimized variants in one process.  Exact gate for AR greedy
-decoding is TIE-AWARE token-id equality (verifier law 2: ties are
-arbitration, not divergence).  On the first mismatching position the
-gate runs one teacher-forced forward on the reference prefix and
-measures the top-2 logit gap: the flip is accepted only if the two
-tokens ARE the top-2 pair within a bf16-resolution epsilon — proven,
-never assumed.  Anything else is refused with the measured gap as
-evidence.
+decoding is TIE-AWARE token-id equality (verifier law 2: a token
+disagreement can be arbitration rather than divergence).
+
+The adjudication rule is NOT inline here — it lives in
+``wllm.verify.adjudicate`` so every benchmark shares one audited,
+unit-tested implementation.  On the first mismatching position the gate
+measures the logit row twice: once by teacher-forced prefill over the
+reference prefix, once by replaying that prefix through incremental
+decode with a KV cache.  The flip is accepted only if BOTH disputed
+tokens sit within epsilon of the maximum logit (epsilon-optimal set)
+*and* the two measurement paths agree.  Paths that disagree yield
+``undecidable`` and the plan is refused: a knife edge that moves when
+you change how you measure it has not been proven benign.  Everything
+else is refused with the measured gaps as evidence.
 
 Levers: static KV cache, torch.compile on the language model.  Metrics:
 TTFT-proxy (prefill+first token), full-generation wall, tokens/s.
@@ -38,6 +45,9 @@ def main() -> int:
 
     from wllm.planner.plan import DeploymentPlan, Stage
     from wllm.planner.search import Measurement, successive_halving
+    from wllm.verify.adjudicate import (
+        EPSILON_DEFAULT, adjudicate_generation, first_divergence,
+    )
 
     processor = AutoProcessor.from_pretrained(MODEL_DIR)
     model = AutoModelForImageTextToText.from_pretrained(
@@ -69,38 +79,7 @@ def main() -> int:
         return out[0, inputs["input_ids"].shape[1]:].tolist()
 
     ref_tokens = {}
-    TIE_GAP_EPS = 1e-3   # bf16 logit resolution; the Alpha flip had gap 0.0
-
-    def tie_adjudicate(pos: int, ref: list[int], got: list[int]):
-        """Teacher-forced forward on the reference prefix up to ``pos``.
-
-        Returns (is_tie, gap, top2_ids): the flip counts as arbitration
-        only if {ref[pos], got[pos]} is exactly the top-2 logit pair and
-        their gap is within epsilon. One extra forward per adjudication
-        — measured evidence, not tolerance hand-waving.
-        """
-        ids = inputs["input_ids"]
-        if pos:
-            ext = torch.tensor([ref[:pos]], device=ids.device,
-                               dtype=ids.dtype)
-            ids = torch.cat([ids, ext], dim=1)
-        fwd = dict(inputs)
-        fwd["input_ids"] = ids
-        if "attention_mask" in fwd:
-            fwd["attention_mask"] = torch.ones_like(ids)
-        with torch.inference_mode():
-            logits = model(**fwd).logits[0, -1].float()
-        # epsilon-optimal-set criterion: knife edges can be degenerate
-        # beyond two tokens (observed live: a three-way tie resolved
-        # differently by dynamic-cache, static-cache, and teacher-forced
-        # paths), so the flip is arbitration iff BOTH disputed tokens
-        # sit within epsilon of the maximum logit
-        mx = float(logits.max())
-        gap_ref = mx - float(logits[ref[pos]])
-        gap_got = mx - float(logits[got[pos]])
-        gap = max(gap_ref, gap_got)
-        return (gap <= TIE_GAP_EPS, gap,
-                {"ref_gap": round(gap_ref, 6), "got_gap": round(gap_got, 6)})
+    TIE_GAP_EPS = EPSILON_DEFAULT   # bf16 logit band; the Alpha flip had 0.0
 
     def apply(plan_id: str):
         if plan_id == "ar_base":
@@ -124,6 +103,7 @@ def main() -> int:
             times.append((time.monotonic() - t0) * 1000.0)
         med = sorted(times)[len(times) // 2]
 
+        verdict_blob = None
         if "ar_base" not in ref_tokens:
             ref_tokens["ar_base"] = toks
             exact, err = True, ""
@@ -132,40 +112,54 @@ def main() -> int:
             exact = toks == ref
             err = ""
             if not exact:
-                mism = [i for i, (a, b) in enumerate(zip(toks, ref))
-                        if a != b]
-                if not mism:
+                div = first_divergence(ref, toks)
+                if not div.adjudicable:
+                    # a pure prefix/length difference has no disputed
+                    # logit row to judge — EOS timing, refused as before
                     err = (f"length mismatch (EOS timing): "
                            f"{len(toks)} vs {len(ref)} tokens")
                 else:
-                    pos = mism[0]
-                    is_tie, gap, pair = tie_adjudicate(pos, ref, toks)
-                    if is_tie:
-                        exact = True
-                        print(f"[tie-gate] {plan.id}: flip at pos {pos} "
-                              f"adjudicated as argmax tie (top-2 gap "
-                              f"{gap:.2e}, pair {pair}); accepted per "
-                              f"tie-aware exact", flush=True)
-                    else:
-                        # KNOWN LIMITATION (observed live): the
-                        # adjudication forward is a PREFILL pass while
-                        # generation decodes incrementally; bf16 kernel
-                        # differences between the two paths can shift a
-                        # knife-edge tie so the flip tokens miss the
-                        # teacher-forced top-2. Refusing is the safe
-                        # verdict; the full diagnostic makes the case
-                        # auditable.
+                    pos = div.position
+                    try:
+                        adj = adjudicate_generation(model, inputs, ref, toks,
+                                                    epsilon=TIE_GAP_EPS)
+                    except Exception as exc:                   # noqa: BLE001
+                        adj = None
                         err = (f"greedy token mismatch at pos {pos}: "
-                               f"ref={ref[pos]} got={toks[pos]}, "
-                               f"teacher-forced top2 {pair} gap "
-                               f"{gap:.4f} — not adjudicable as a tie")
+                               f"ref={div.reference_token} "
+                               f"got={div.candidate_token}; adjudication "
+                               f"could not be measured "
+                               f"({type(exc).__name__}: {exc}) — refused, "
+                               f"no evidence is not a pass")
+                        print(f"[tie-gate] {plan.id}: REFUSED — {err}",
+                              flush=True)
+                    if adj is not None:
+                        verdict_blob = adj.as_dict()
+                        for note in adj.notes:
+                            print(f"[tie-gate] {plan.id}: note — {note}",
+                                  flush=True)
+                        if adj.is_benign:
+                            exact = True
+                            print(f"[tie-gate] {plan.id}: ACCEPTED "
+                                  f"{adj.summary()}", flush=True)
+                        else:
+                            # verdict is real_divergence or undecidable;
+                            # both are refusals, with different diagnoses
+                            err = (f"greedy token mismatch at pos {pos}: "
+                                   f"ref={div.reference_token} "
+                                   f"got={div.candidate_token} -> "
+                                   f"{adj.verdict}; {adj.reason}")
+                            print(f"[tie-gate] {plan.id}: REFUSED "
+                                  f"{adj.summary()}", flush=True)
         n_tok = len(toks)
+        extra = {"times_ms": times, "n_tokens": n_tok,
+                 "t_elapsed_s": time.monotonic() - _T0}
+        if verdict_blob is not None:
+            extra["adjudication"] = verdict_blob
         return Measurement(plan_id=plan.id, duration_s=duration_s, ok=exact,
                            latency_ms=med,
                            sustained_rate=n_tok / (med / 1000.0),
-                           error=err,
-                           extra={"times_ms": times, "n_tokens": n_tok,
-                                  "t_elapsed_s": time.monotonic() - _T0})
+                           error=err, extra=extra)
 
     plans = [
         DeploymentPlan(id="ar_base", stages=[Stage(id="s", node_ids=["lm"],

@@ -28,14 +28,18 @@ TARGETS = (
     "wllm/control/state.py",
     "wllm/control/spec.py",
     "wllm/techniques/step_cache.py",
+    "wllm/techniques/step_cache_tensor.py",
     "wllm/techniques/orchestrator.py",
     "wllm/composite/batching.py",
+    "wllm/verify/adjudicate.py",
 )
 SANDBOX_FILES = (
     "wllm/__init__.py",
     "tests/test_control_plane.py",
     "tests/test_composite.py",
     "tests/test_techniques.py",
+    "tests/test_adjudicate.py",
+    "tests/test_step_cache_tensor.py",
 )
 SANDBOX_TREES = (
     "wllm/control",
@@ -43,11 +47,14 @@ SANDBOX_TREES = (
     "wllm/composite",
     "wllm/planner",      # composite.lowering imports planner.plan
     "wllm/techniques",
+    "wllm/verify",       # token-disagreement adjudication (verifier law 2)
 )
 TEST_CMDS = (
     [sys.executable, "tests/test_control_plane.py"],
     [sys.executable, "tests/test_composite.py"],
     [sys.executable, "tests/test_techniques.py"],
+    [sys.executable, "tests/test_adjudicate.py"],
+    [sys.executable, "tests/test_step_cache_tensor.py"],
 )
 
 _CMP_SWAP = {ast.Eq: ast.NotEq, ast.NotEq: ast.Eq, ast.Lt: ast.GtE,

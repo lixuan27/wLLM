@@ -33,7 +33,7 @@ testpaths = ["tests"]
 
 [tool.coverage.run]
 source = ["wllm/control", "wllm/composite", "wllm/techniques", "wllm/omni",
-          "wllm/profiles"]
+          "wllm/profiles", "wllm/verify"]
 
 [tool.coverage.report]
 show_missing = true
