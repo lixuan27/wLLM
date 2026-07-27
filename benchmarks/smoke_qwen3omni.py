@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -20,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 MODEL_ID = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+MODEL_PATH = os.environ.get("WLLM_Q3O_PATH", MODEL_ID)
 NEW_TOKENS = 64
 REPS = 2
 
@@ -29,9 +31,9 @@ def main() -> int:
     from transformers import AutoProcessor, Qwen3OmniMoeForConditionalGeneration
 
     t0 = time.monotonic()
-    processor = AutoProcessor.from_pretrained(MODEL_ID)
+    processor = AutoProcessor.from_pretrained(MODEL_PATH)
     model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
-        MODEL_ID, torch_dtype=torch.bfloat16, device_map="cuda")
+        MODEL_PATH, torch_dtype=torch.bfloat16, device_map="cuda")
     model.eval()
     path_notes = []
     if hasattr(model, "disable_talker"):

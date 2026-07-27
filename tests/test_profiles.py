@@ -36,7 +36,7 @@ def _base_dict(**over) -> dict:
 def test_real_pack_loads_and_matches():
     profiles = load_profiles()
     assert {"wan2.2-ti2v", "qwen3-vl", "openvla",
-            "cosmos3-nano", "vjepa2-vitl"} <= set(profiles)
+            "cosmos3-nano", "vjepa2-vitl", "qwen3-omni"} <= set(profiles)
     for prof in profiles.values():
         assert prof.validate() == []
         assert prof.binding.evidence_level == "measured"

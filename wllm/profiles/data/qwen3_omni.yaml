@@ -1,0 +1,29 @@
+# Qwen3-Omni 30B-A3B — grounded in the onboarding smoke (job 202109) only.
+model_family: qwen3-omni
+detection_ids:
+  - Qwen/Qwen3-Omni-30B-A3B-Instruct
+  - "Qwen/Qwen3-Omni-30B-A3B*"
+components: [thinker_moe_lm, talker, audio_encoder, vision_encoder]
+runtime_support:
+  - runtime: torch-local
+    tier: launchable
+    evidence:
+      - {kind: job_log, ref: "job 202109",
+         note: "thinker-only text smoke: greedy 65 tokens at 24.2 tok/s
+                median, load 123s, peak VRAM 65.7GB bf16 on 1xH200;
+                talker disabled via disable_talker() and
+                generate(return_audio=False) — the audio-out chain is
+                UNMEASURED and not claimed here"}
+optimizations_lossless: []
+optimizations_bounded: []
+incompatibilities: []
+authenticity_signals:
+  - path_notes_recorded
+validation:
+  - fixed_prompt_greedy_smoke
+binding:
+  backend_version: "0.0.1a0"
+  hardware: 1xH200
+  cuda: ""
+  last_validated: "2026-07-27"
+  evidence_level: measured

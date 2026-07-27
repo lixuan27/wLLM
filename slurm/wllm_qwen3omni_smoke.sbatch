@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=wllm_qwen3omni_smoke
+#SBATCH --job-name=wllm_qwen3omni_smoke_retry1
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -15,7 +15,7 @@
 set -uo pipefail
 echo "Job ID: $SLURM_JOB_ID"; echo "Node: $SLURM_NODELIST"; echo "Start: $(date)"
 cd /public/home/lixuan/lixuan/wllm-infra
-export HF_HOME=/public/home/lixuan/lixuan/pretrained-model/Qwen3-Omni-30B-A3B-Instruct-hfcache
+export WLLM_Q3O_PATH=/public/home/lixuan/lixuan/pretrained-model/Qwen3-Omni-30B-A3B-Instruct
 export HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export PATH=/public/home/lixuan/lixuan/wllm-infra/.venv/bin:$PATH
 TODAY=$(date +%F)
@@ -27,13 +27,24 @@ step "qwen3omni 1: thinker text smoke (fixed prompt, greedy)"
   | tee /tmp/q3o_smoke_$SLURM_JOB_ID.txt || FAIL=1
 grep -q "QWEN3OMNI_SMOKE_OK" /tmp/q3o_smoke_$SLURM_JOB_ID.txt || FAIL=1
 
-step "qwen3omni 2: honest control-plane view (no profile yet)"
+step "qwen3omni 2: honest control-plane view (registry-only knowledge)"
+# retry1 root cause: this model hits the registry's Qwen/* compatible
+# glob, so the planner legitimately emits registry-only candidates
+# (rc 0) with the no-verified-profile caveat; rc 3 diagnose-only is
+# reserved for models no backend claims at all.
 .venv/bin/python scripts/seed_traces_beta.py || FAIL=1
 .venv/bin/python -m wllm.control.cli candidates . \
   --model Qwen/Qwen3-Omni-30B-A3B-Instruct --hardware 1xH200 --num-gpus 1 \
-  --traces .wllm/traces/beta.jsonl --today "$TODAY"
+  --traces .wllm/traces/beta.jsonl --today "$TODAY" \
+  | tee /tmp/q3o_cand_$SLURM_JOB_ID.txt
 RC=$?
-[ "$RC" -eq 3 ] || { echo "qwen3omni: expected diagnose-only rc 3, got $RC"; FAIL=1; }
+[ "$RC" -eq 0 ] || { echo "qwen3omni: candidates rc $RC != 0"; FAIL=1; }
+grep -q "no verified profile matches this model" \
+  /tmp/q3o_cand_$SLURM_JOB_ID.txt \
+  || { echo "qwen3omni: missing no-profile caveat"; FAIL=1; }
+grep -q "candidate wllm-serving \[compatible\]" \
+  /tmp/q3o_cand_$SLURM_JOB_ID.txt \
+  || { echo "qwen3omni: expected compatible-tier candidate"; FAIL=1; }
 
 step "qwen3omni 3: record the Launchable baseline into the trace store"
 WLLM_Q3O_TODAY="$TODAY" WLLM_Q3O_JOB="$SLURM_JOB_ID" \
