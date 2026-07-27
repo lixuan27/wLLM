@@ -198,6 +198,25 @@ def test_known_bad_subset_matching_and_rehabilitation():
                                     "mode": "max-autotune"}))
         assert st.known_bad("org/model-a", "1xH200",
                             {"pass": "compile", "gpus": 1}) is None
+        # ...but only within the workload it was measured on. Add an
+        # acceptance for a DIFFERENT workload and an unqualified probe
+        # must go back to refusing, because the store can no longer tell
+        # which evidence the caller meant.
+        st.append(_trace(status="rejected", reason="collapsed at 20 steps",
+                         workload="t2v 20 steps",
+                         candidate={"pass": "compile", "gpus": 1,
+                                    "mode": "max-autotune"}))
+        ambiguous = st.known_bad("org/model-a", "1xH200",
+                                 {"pass": "compile", "gpus": 1})
+        assert ambiguous is not None and "20 steps" in ambiguous.reason
+        # naming either workload resolves it, in opposite directions
+        assert st.known_bad("org/model-a", "1xH200",
+                            {"pass": "compile", "gpus": 1},
+                            workload="decode 128 tok") is None
+        still_bad = st.known_bad("org/model-a", "1xH200",
+                                 {"pass": "compile", "gpus": 1},
+                                 workload="t2v 20 steps")
+        assert still_bad is not None
 
 
 # --------------------------------------------------------- corrupt lines
@@ -226,27 +245,27 @@ def test_seed_beta_traces_idempotent():
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "beta.jsonl"
         st = TraceStore(path)
-        assert seed_beta_traces(st) == 8
-        assert len(st.all()) == 8
+        assert seed_beta_traces(st) == 10
+        assert len(st.all()) == 10
         assert seed_beta_traces(st) == 0    # second run adds nothing
-        assert st.deduped == 8
+        assert st.deduped == 10
         st2 = TraceStore(path)              # fresh load, same result
-        assert st2.corrupt_lines == 0 and len(st2.all()) == 8
+        assert st2.corrupt_lines == 0 and len(st2.all()) == 10
         assert seed_beta_traces(st2) == 0
         lines = [x for x in path.read_text().splitlines() if x.strip()]
-        assert len(lines) == 8
+        assert len(lines) == 10
 
 
 def test_seed_content_matches_reports():
     seeds = beta_seed_traces()
-    assert len(seeds) == 8
+    assert len(seeds) == 10
     for t in seeds:
         assert t.validate() == [], t
         assert t.evidence, "every seed must point at real evidence"
         assert t.recorded in ("2026-07-24", "2026-07-25", "2026-07-27")
     accepted = [t for t in seeds if t.status == "accepted"]
     rejected = [t for t in seeds if t.status == "rejected"]
-    assert len(accepted) == 3 and len(rejected) == 5
+    assert len(accepted) == 4 and len(rejected) == 6
     # the corpus must contain at least one candidate that was FAST and
     # refused anyway; without such a row a speed-only planner would look
     # indistinguishable from ours on this evidence
@@ -279,14 +298,33 @@ def test_seed_content_matches_reports():
                             "torch_compile_max_autotune",
                             "torch_compile_reduce_overhead",
                             "reuse_cache",
-                            "static_kv_cache"}   # withdrawn 2026-07-27
+                            "static_kv_cache",      # withdrawn 2026-07-27
+                            "auto_compiled_decode"}
         # the withdrawal must SUPERSEDE the acceptance rather than erase
         # it: the accepted row is still in history, and the planner's
         # known_bad answer flips to rejected because the later trace wins
         assert len(st.query(pass_name="static_kv_cache")) == 2
         withdrawn = st.known_bad("Qwen/Qwen3-VL-8B-Instruct", "1xH200",
                                  {"pass": "static_kv_cache", "gpus": 1})
-        assert withdrawn is not None and "UNPROVEN" in withdrawn.reason
+        assert withdrawn is not None and "DISPROVEN" in withdrawn.reason
+        # the same pass name is rejected on one model and still accepted
+        # on another only if the evidence says so — reuse_cache carries
+        # both a refusal (20 steps) and an acceptance (50 steps), and the
+        # store must not collapse them into one verdict
+        reuse = st.query(pass_name="reuse_cache")
+        assert {t.status for t in reuse} == {"accepted", "rejected"}
+        # and rehabilitation must not cross workloads: the 50-step
+        # acceptance says nothing about the 20-step schedule, where the
+        # same pass is measured to destroy the output
+        probe = {"pass": "reuse_cache", "gpus": 1}
+        assert st.known_bad(
+            "Wan-AI/Wan2.2-TI2V-5B", "1xH200", probe,
+            workload="t2v 33f@480x832, 50 denoise steps") is None
+        blocked = st.known_bad("Wan-AI/Wan2.2-TI2V-5B", "1xH200", probe)
+        assert blocked is not None and blocked.status == "rejected", (
+            "without a workload the store cannot know which evidence "
+            "applies, so a rejection anywhere must outweigh an "
+            "acceptance elsewhere")
         for reasons in pat.values():
             assert all(r.strip() for r in reasons)
 

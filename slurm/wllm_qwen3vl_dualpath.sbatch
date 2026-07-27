@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=wllm_qwen3vl_dualpath
+#SBATCH --job-name=wllm_qwen3vl_dualpath_retry1
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

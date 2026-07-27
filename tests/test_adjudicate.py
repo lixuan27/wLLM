@@ -21,25 +21,33 @@ sys.path.insert(0, str(ROOT))
 from wllm.verify.adjudicate import (
     BENIGN_TIE, DISAGREEMENT_FRACTION_DEFAULT, EPSILON_DEFAULT, IDENTICAL,
     LENGTH_MISMATCH, PATH_DECODE, PATH_PREFILL, POSITION_BUDGET_DEFAULT,
-    REAL_DIVERGENCE, TOKEN_MISMATCH, UNDECIDABLE, Adjudication, PathEvidence,
-    adjudicate, adjudicate_generation, adjudicate_row, aggregate_positions,
-    decode_logit_row, decode_logit_rows, divergence_positions,
-    first_divergence, prefill_logit_row, select_positions,
+    REAL_DIVERGENCE, TOKEN_MISMATCH, UNDECIDABLE, AdjudicationError,
+    Adjudication, DecodeReplayUnavailable, PathEvidence,
+    PositionAccountingError, adjudicate, adjudicate_generation,
+    adjudicate_row, aggregate_positions, decode_logit_row, decode_logit_rows,
+    divergence_positions, first_divergence, plan_prefix_extension,
+    prefill_logit_row, select_positions,
 )
 
 ADJUDICATE_PY = ROOT / "wllm" / "verify" / "adjudicate.py"
 
 
-def _raises(fn, *frags):
-    """Call ``fn`` and assert it raises ValueError mentioning ``frags``."""
+def _raises_type(exc_type, fn, *frags):
+    """Call ``fn``; assert it raises ``exc_type`` mentioning ``frags``."""
     try:
         fn()
-    except ValueError as exc:
+    except exc_type as exc:
         text = str(exc).lower()
         for frag in frags:
             assert frag.lower() in text, f"{frag!r} not in {text!r}"
         return exc
-    raise AssertionError(f"expected ValueError mentioning {frags}")
+    raise AssertionError(
+        f"expected {exc_type.__name__} mentioning {frags}")
+
+
+def _raises(fn, *frags):
+    """Call ``fn`` and assert it raises ValueError mentioning ``frags``."""
+    return _raises_type(ValueError, fn, *frags)
 
 
 # ------------------------------------------------------------------ rule A
@@ -326,6 +334,197 @@ def test_first_divergence_length_mismatch_both_directions():
 def test_token_mismatch_wins_over_length_mismatch():
     d = first_divergence([1, 5], [1, 6, 7, 8])
     assert d.kind == TOKEN_MISMATCH and d.position == 1
+
+
+# --------------------------------------------------------- position accounting
+
+def test_plan_prefix_extension_grows_every_per_position_input():
+    """The defect this exists to prevent: one companion left at prompt
+    length while input_ids grew, which blows up deep inside the model."""
+    plan = plan_prefix_extension(
+        {"attention_mask": 220, "mm_token_type_ids": 220},
+        prompt_length=220, prefix_length=43)
+    assert plan == {"attention_mask": 1, "mm_token_type_ids": 0}
+    # a generated token is real (mask 1) and always text (mm type 0)
+    assert plan["attention_mask"] == 1 and plan["mm_token_type_ids"] == 0
+    assert plan_prefix_extension({"token_type_ids": 5}, prompt_length=5,
+                                 prefix_length=2) == {"token_type_ids": 0}
+
+
+def test_plan_prefix_extension_skips_what_is_already_aligned():
+    # zero prefix: nothing to do
+    assert plan_prefix_extension({"attention_mask": 220}, prompt_length=220,
+                                 prefix_length=0) == {}
+    # already extended by the caller
+    assert plan_prefix_extension({"attention_mask": 263}, prompt_length=220,
+                                 prefix_length=43) == {}
+    assert plan_prefix_extension({}, prompt_length=1, prefix_length=1) == {}
+
+
+def test_plan_prefix_extension_refuses_what_it_cannot_reconcile():
+    """The honest failure: name the input and BOTH lengths, never guess."""
+    exc = _raises_type(
+        PositionAccountingError,
+        lambda: plan_prefix_extension({"mm_token_type_ids": 199},
+                                      prompt_length=220, prefix_length=43),
+        "mm_token_type_ids", "199", "220", "263")
+    assert isinstance(exc, AdjudicationError)
+    # a per-position input with no defined appended value is refused, not
+    # invented — position_ids is derived and 3-D under multimodal rope
+    _raises_type(
+        PositionAccountingError,
+        lambda: plan_prefix_extension({"position_ids": 220},
+                                      prompt_length=220, prefix_length=43),
+        "position_ids", "no defined value")
+    _raises(lambda: plan_prefix_extension({}, prompt_length=0,
+                                          prefix_length=1), "prompt_length")
+    _raises(lambda: plan_prefix_extension({}, prompt_length=4,
+                                          prefix_length=-1), "prefix_length")
+
+
+def test_prefill_extends_expanded_vision_companions():
+    """Regression: a prompt whose vision placeholders are pre-expanded.
+
+    The processor already emits one id per embedding position, so
+    ``mm_token_type_ids`` is per-position too and must grow with
+    ``input_ids``.  Leaving it at prompt length is what produced
+    'mask [263] vs indexed tensor [220]' from inside the model.
+    """
+    model = _StubModel([[1.0, 2.0]])
+    inputs = _vision_inputs()
+    with _stub_torch():
+        row = prefill_logit_row(model, inputs, [41, 42])
+    assert row == [1.0, 2.0]
+    call = model.calls[0]
+    assert call["input_ids"].rows == [[5, 90, 90, 90, 7, 41, 42]]
+    assert call["attention_mask"].rows == [[1, 1, 1, 1, 1, 1, 1]]
+    # appended positions are text (0), the expanded image run keeps its 1s
+    assert call["mm_token_type_ids"].rows == [[0, 1, 1, 1, 0, 0, 0]]
+    for name in ("input_ids", "attention_mask", "mm_token_type_ids"):
+        assert call[name].shape[1] == 7, name
+    # non-per-position inputs pass through untouched
+    assert call["image_grid_thw"].rows == [[1, 2, 2]]
+    assert call["pixel_values"] == "IMG"
+    assert inputs["mm_token_type_ids"].rows == [[0, 1, 1, 1, 0]]   # unmutated
+
+
+def test_prefill_refuses_inputs_it_cannot_account_for():
+    model = _StubModel([[1.0, 2.0]])
+    with _stub_torch():
+        stale = _vision_inputs()
+        stale["mm_token_type_ids"] = _Mat([[0, 1, 1]])        # wrong length
+        _raises_type(PositionAccountingError,
+                     lambda: prefill_logit_row(model, stale, [41]),
+                     "mm_token_type_ids", "3")
+        derived = _vision_inputs()
+        derived["position_ids"] = _Mat([[0, 1, 2, 3, 4]])
+        _raises_type(PositionAccountingError,
+                     lambda: prefill_logit_row(model, derived, [41]),
+                     "position_ids", "no defined value")
+        unknown = _vision_inputs()
+        unknown["some_mask"] = _Mat([[1, 1, 1, 1, 1]])        # (1, prompt)
+        _raises_type(PositionAccountingError,
+                     lambda: prefill_logit_row(model, unknown, [41]),
+                     "some_mask", "looks", "per-position")
+        batched = _vision_inputs()
+        batched["input_ids"] = _Mat([[5, 6], [7, 8]])
+        _raises_type(PositionAccountingError,
+                     lambda: prefill_logit_row(model, batched, [41]),
+                     "single-sequence", "batch 2")
+    assert model.calls == []                 # refused before any forward
+
+
+def test_prefill_leaves_genuine_vision_tensors_alone():
+    """The structural guard must not fire on real multimodal inputs.
+
+    A patch tensor can easily share its last dimension with the prompt
+    length; what makes an input per-position is (batch, sequence), so the
+    batch check is what keeps this guard from refusing valid inputs.
+    """
+    model = _StubModel([[1.0, 2.0]])
+    inputs = _vision_inputs()
+    inputs["pixel_values"] = _Shaped((256, 5))     # (patches, feat) — not (1, 5)
+    inputs["deepstack_features"] = _Shaped((1, 3, 5))          # 3-D
+    inputs["rope_deltas"] = _Shaped((5,))                      # 1-D
+    with _stub_torch():
+        row = prefill_logit_row(model, inputs, [41])
+    assert row == [1.0, 2.0]
+    assert model.calls[0]["input_ids"].rows == [[5, 90, 90, 90, 7, 41]]
+    assert model.calls[0]["mm_token_type_ids"].rows == [[0, 1, 1, 1, 0, 0]]
+
+
+def test_prefill_refuses_input_ids_it_cannot_read():
+    model = _StubModel([[1.0, 2.0]])
+    with _stub_torch():
+        _raises_type(PositionAccountingError,
+                     lambda: prefill_logit_row(model, {"input_ids": "nope"},
+                                               [1]),
+                     "no shape")
+        _raises_type(PositionAccountingError,
+                     lambda: prefill_logit_row(
+                         model, {"input_ids": _Shaped((3,))}, [1]),
+                     "must be (batch, sequence)")
+    assert model.calls == []
+
+
+def test_decode_replay_drives_the_models_own_generation_contract():
+    """Position accounting is the model's, not an offset we inferred."""
+    model = _StubModel([_tie_row({i}) for i in range(4)])
+    with _stub_torch():
+        rows = decode_logit_rows(model, _vision_inputs(),
+                                 [41, 42, 43], [0, 3])
+    assert sorted(rows) == [0, 3]
+    assert len(model.calls) == 4                  # 1 + max(position)
+    # the prompt forward is the only one that is "first": it consumes the
+    # image tensors and is not sliced
+    assert model.prepared[0] == {"len": 5, "next": None, "first": True,
+                                 "use_cache": True}
+    for prep in model.prepared[1:]:
+        assert prep["next"] == 1 and prep["first"] is False
+        # the replay must ask for caching: without it every step would be
+        # a fresh prefill and there would be no decode path to measure
+        assert prep["use_cache"] is True
+    assert model.prepared[1]["len"] == 6           # full running sequence
+    assert model.prepared[3]["len"] == 8
+    assert model.calls[0]["pixel_values"] == "IMG"
+    assert "pixel_values" not in model.calls[1]
+    # per-step growth of the per-position companions, done by the model's
+    # own bookkeeping rather than by this adapter
+    assert model.calls[1]["input_ids"].rows == [[41]]
+    assert model.calls[1]["attention_mask"].rows == [[1] * 6]
+    assert model.calls[1]["mm_token_type_ids"].rows == [[0]]   # sliced to 1
+    assert model.calls[1]["past_key_values"] == ("cache", 1)
+    assert model.calls[3]["attention_mask"].rows == [[1] * 8]
+
+
+def test_decode_replay_refuses_a_model_without_the_generation_contract():
+    plain = _StubModel([_tie_row({1})], contract=False)
+    with _stub_torch():
+        _raises_type(DecodeReplayUnavailable,
+                     lambda: decode_logit_rows(plain, _stub_inputs(), [1], [1]),
+                     "prepare_inputs_for_generation")
+
+    class _HalfContract(_StubModel):
+        _update_model_kwargs_for_generation = None
+
+    half = _HalfContract([_tie_row({1})])
+    with _stub_torch():
+        _raises_type(DecodeReplayUnavailable,
+                     lambda: decode_logit_rows(half, _stub_inputs(), [1], [1]),
+                     "_update_model_kwargs_for_generation")
+
+
+def test_decode_replay_reports_a_rejected_contract_by_name():
+    class _OldSignature(_StubModel):
+        def prepare_inputs_for_generation(self, input_ids, **kwargs):
+            raise TypeError("unexpected keyword argument "
+                            "'next_sequence_length'")
+
+    model = _OldSignature([_tie_row({1})])
+    with _stub_torch():
+        _raises_type(DecodeReplayUnavailable,
+                     lambda: decode_logit_rows(model, _stub_inputs(), [1], [1]),
+                     "next_sequence_length", "generation-loop contract")
 
 
 # ------------------------------------------------- rule C: whole generation
@@ -643,6 +842,13 @@ class _Vec:
         return list(self.values)
 
 
+class _Shaped:
+    """Stand-in for a tensor the adapters only inspect the shape of."""
+
+    def __init__(self, shape):
+        self.shape = tuple(shape)
+
+
 class _Mat:
     """Stand-in for a 2-D tensor: only what the adapters actually touch."""
 
@@ -651,10 +857,28 @@ class _Mat:
         self.device = device
         self.dtype = dtype
 
+    @property
+    def shape(self):
+        return (len(self.rows), len(self.rows[0]))
+
     def __getitem__(self, key):
         i, j = key
         cell = self.rows[i][j]
         return _Vec(cell if isinstance(cell, list) else [cell])
+
+    def new_full(self, shape, value):
+        return _Mat([[value] * shape[1] for _ in range(shape[0])],
+                    device=self.device, dtype=self.dtype)
+
+    def new_ones(self, shape):
+        return self.new_full(shape, 1)
+
+    def new_zeros(self, shape):
+        return self.new_full(shape, 0)
+
+    def tail(self, n):
+        return _Mat([r[-n:] for r in self.rows],
+                    device=self.device, dtype=self.dtype)
 
 
 def _fake_torch():
@@ -664,7 +888,7 @@ def _fake_torch():
         return _Mat(data, device=device, dtype=dtype)
 
     def cat(mats, dim=1):
-        assert dim == 1, "adapters only ever concatenate along the sequence"
+        assert dim in (1, -1), "adapters only concatenate along the sequence"
         rows = [sum((m.rows[i] for m in mats), [])
                 for i in range(len(mats[0].rows))]
         return _Mat(rows, device=mats[0].device, dtype=mats[0].dtype)
@@ -709,12 +933,28 @@ class _stub_torch:
 
 
 class _StubModel:
-    """Returns a scripted logit row per forward call and records the call."""
+    """Scripted logit rows, plus a faithful miniature of the generation
+    contract the decode replay drives.
 
-    def __init__(self, rows, cache=True):
+    ``prepare_inputs_for_generation`` and
+    ``_update_model_kwargs_for_generation`` mirror the framework's real
+    semantics: slice ``input_ids`` to the new positions, drop the image
+    tensors after the first iteration, and per step grow the attention
+    mask with ones, ``mm_token_type_ids`` with zeros (a generated token
+    is always text) and thread the KV cache through.  Driving a stub that
+    encodes the contract is what makes the replay's position accounting
+    testable without a GPU.
+    """
+
+    def __init__(self, rows, cache=True, contract=True):
         self.rows = [list(r) for r in rows]
         self.cache = cache
+        self.contract = contract
         self.calls = []
+        self.prepared = []
+        if not contract:                    # a model without the contract
+            self.prepare_inputs_for_generation = None
+            self._update_model_kwargs_for_generation = None
 
     def __call__(self, **kw):
         self.calls.append(kw)
@@ -723,10 +963,61 @@ class _StubModel:
         out.past_key_values = ("cache", len(self.calls)) if self.cache else None
         return out
 
+    def prepare_inputs_for_generation(self, input_ids,
+                                      next_sequence_length=None,
+                                      is_first_iteration=False, **kwargs):
+        self.prepared.append({"len": input_ids.shape[1],
+                              "next": next_sequence_length,
+                              "first": is_first_iteration,
+                              "use_cache": kwargs.get("use_cache")})
+        model_inputs = dict(kwargs)
+        model_inputs.pop("use_cache", None)
+        model_inputs["use_cache"] = True
+        model_inputs["input_ids"] = (input_ids if next_sequence_length is None
+                                     else input_ids.tail(next_sequence_length))
+        seq = model_inputs["input_ids"].shape[1]
+        for name in ("position_ids", "token_type_ids", "mm_token_type_ids"):
+            value = model_inputs.get(name)
+            if value is not None and value.shape[-1] != seq:
+                model_inputs[name] = value.tail(seq)
+        if not is_first_iteration:
+            model_inputs.pop("pixel_values", None)
+        return model_inputs
+
+    def _update_model_kwargs_for_generation(self, outputs, model_kwargs,
+                                            is_encoder_decoder=False,
+                                            num_new_tokens=1):
+        updated = dict(model_kwargs)
+        updated["past_key_values"] = outputs.past_key_values
+        mask = updated.get("attention_mask")
+        if mask is not None:
+            updated["attention_mask"] = _cat2(
+                mask, mask.new_ones((1, num_new_tokens)))
+        mm = updated.get("mm_token_type_ids")
+        if mm is not None:
+            updated["mm_token_type_ids"] = _cat2(
+                mm, mm.new_zeros((1, num_new_tokens)))
+        return updated
+
+
+def _cat2(left, right):
+    return _Mat([lrow + rrow for lrow, rrow in zip(left.rows, right.rows)],
+                device=left.device, dtype=left.dtype)
+
 
 def _stub_inputs():
     return {"input_ids": _Mat([[5, 6, 7]]),
             "attention_mask": _Mat([[1, 1, 1]]),
+            "pixel_values": "IMG"}
+
+
+def _vision_inputs():
+    """A prompt whose vision placeholders are ALREADY expanded by the
+    processor: 5 positions, of which 1..3 are image ids."""
+    return {"input_ids": _Mat([[5, 90, 90, 90, 7]]),
+            "attention_mask": _Mat([[1, 1, 1, 1, 1]]),
+            "mm_token_type_ids": _Mat([[0, 1, 1, 1, 0]]),
+            "image_grid_thw": _Mat([[1, 2, 2]]),
             "pixel_values": "IMG"}
 
 
@@ -841,7 +1132,10 @@ def test_generation_adapter_degrades_to_single_path_with_a_note():
     assert res.verdict == BENIGN_TIE           # the old, weaker behaviour
     assert len(res.notes) == 1
     assert "decode-path replay unavailable" in res.notes[0]
-    assert "RuntimeError" in res.notes[0]
+    # the typed error surfaces BY NAME, so a reader of the refusal knows
+    # which invariant broke rather than seeing a bare IndexError
+    assert "DecodeReplayUnavailable" in res.notes[0]
+    assert "KV cache" in res.notes[0]
     assert res.as_dict()["notes"] == list(res.notes)
 
 

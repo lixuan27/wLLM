@@ -1,24 +1,44 @@
 # Qwen3-VL 8B.
 #
-# WITHDRAWN CLAIM (2026-07-27, job 202244): this profile used to carry
-# static_kv_cache as a measured EXACT optimization at 2.75x. That claim
-# was granted under the older adjudication rule, which ruled on the
-# teacher-forced prefill path alone. Under the strengthened rule
-# (epsilon-optimal set AND prefill/decode consistency) it could not be
-# re-established: the greedy token mismatch is still there (position 43,
-# ref 3691 vs 6303), and the adjudicator that would decide whether that
-# mismatch is arbitration or divergence CRASHED on this model's
-# multimodal path (IndexError: attention mask of length 263 against an
-# indexed tensor of length 220 — the vision placeholder expansion
-# desynchronizes the decode replay's prefix).
+# WITHDRAWN CLAIM (2026-07-27): this profile used to carry
+# static_kv_cache as a measured EXACT optimization at 2.75x, on the
+# grounds that "the single greedy flip sits at a top-2 logit gap of
+# exactly 0.0 — arbitration, not divergence". Two jobs retired it.
 #
-# So the honest status is UNPROVEN, not DISPROVEN. The pass may well be
-# exact; there is simply no evidence for it now, and this project's rule
-# is that no evidence is not a pass. It stays out of the optimization
-# list until a working adjudicator rules on it. The rejection is
-# recorded in the trace store dated 2026-07-27, which supersedes the
-# 2026-07-24 acceptance by the store's latest-trace-wins rule rather
-# than by rewriting history.
+# Job 202244 could not rule at all: the adjudicator crashed on this
+# model's multimodal path, so the status was UNPROVEN and the claim came
+# out pending evidence.
+#
+# Job 202503, with the adjudicator repaired and ruling on a census of
+# positions rather than the first one, RULES AGAINST IT:
+#   static_cache          83 of 128 positions disagree (64.8%)
+#   static_cache_compile 111 of 128 positions disagree (86.7%)
+#   verdict real_divergence, deciding gaps 0.25, 17.75, 22.25
+#   (compile leg: 0.25, 27.625, 9.625) against epsilon 1e-3
+# Gaps of 17-27 logits are not knife edges, and 83 disagreements are not
+# "the single greedy flip". The current measurement does not merely fail
+# to reproduce the original evidence, it contradicts its description;
+# reconciling them would require re-running the original probe, which
+# has not been done, so this file states what was measured and not why
+# the earlier number looked the way it did.
+#
+# Status is therefore DISPROVEN under this workload and configuration,
+# not merely unproven. Caveat recorded rather than buried: the decode
+# replay is still unavailable on this model (a tensor-shape failure
+# distinct from the one job 202244 hit), so both verdicts rest on the
+# teacher-forced prefill path alone, which the tool disclosed in every
+# line. That weakens confidence in a *benign* verdict; it does not
+# rescue gaps of this size.
+#
+# Related and load-bearing (job 202328, a different model): the static
+# cache alone is 0.87x — SLOWER — and the entire speedup attributed to
+# it comes from a compiled forward that requesting the cache silently
+# enables. So "static_kv_cache" was very likely never the name of the
+# mechanism being measured here either.
+#
+# The rejection is recorded in the trace store dated 2026-07-27, which
+# supersedes the 2026-07-24 acceptance by the store's latest-trace-wins
+# rule rather than by rewriting history.
 model_family: qwen3-vl
 detection_ids:
   - Qwen/Qwen3-VL-8B-Instruct

@@ -30,6 +30,16 @@ verdict is only the shared verdict of the two paths; **if the paths
 disagree the outcome is ``undecidable``, never a pass**.  A tie that
 flips depending on how it is measured has not been proven to be a tie.
 
+Rule B needs a decode replay that actually works for the model family in
+question, and that is a real precondition, not a formality: the replay
+is driven through the model's *own* generation input preparation, so a
+model that does not expose that contract cannot be dual-path verified.
+When the replay is unavailable the adapters raise
+:class:`DecodeReplayUnavailable` — typed and described — and the verdict
+degrades to the single prefill path with that fact disclosed in
+``notes``.  A single-path verdict is the older, weaker rule; it is never
+reported as agreement between paths.
+
 **Rule C — generation-level aggregation.**  Rules A and B rule on ONE
 position.  A generation usually disagrees at many (a live MoE run
 disagreed at 227 of 256 positions), and a verdict about the whole
@@ -137,6 +147,23 @@ DISAGREEMENT_FRACTION_DEFAULT = 0.05
 #: ``[[...]]`` (batch of one) and ``[[[...]]]`` are accepted as rows.
 _MAX_SQUEEZE = 2
 
+#: Inputs that must stay aligned one-to-one with ``input_ids``.  This is
+#: not a guess: it is the framework's own list of "inputs that should have
+#: the same length as input_ids" from its generation input preparation,
+#: plus ``attention_mask`` (which spans the whole cache and is grown by
+#: the same bookkeeping).  See :func:`plan_prefix_extension`.
+PER_POSITION_INPUTS = ("attention_mask", "mm_token_type_ids",
+                       "token_type_ids", "position_ids")
+
+#: The value an appended position takes in each per-position input.  Also
+#: taken from the framework's own per-step update rather than invented:
+#: a generated token is real (mask 1) and is always text, never image or
+#: video (``mm_token_type_ids`` 0).  ``position_ids`` is deliberately
+#: absent: it is derived, and for multimodal rope it is 3-D and
+#: model-specific, so this adapter refuses rather than inventing one.
+_APPENDED_POSITION_VALUE = {"attention_mask": 1, "mm_token_type_ids": 0,
+                            "token_type_ids": 0}
+
 #: Disclosed on every multi-position verdict — see the module docstring's
 #: "known scope limit".
 _COUNTERFACTUAL_NOTE = (
@@ -144,6 +171,35 @@ _COUNTERFACTUAL_NOTE = (
     "prefix; once the sequences fork the candidate's own conditioning "
     "differs, so those checks can refuse a candidate but cannot by "
     "themselves prove its actual trajectory optimal")
+
+
+# ---------------------------------------------------------------- exceptions
+
+class AdjudicationError(RuntimeError):
+    """Base: the adjudicator could not measure what it needed to rule.
+
+    Always describes the invariant that broke, so a caller's "no evidence
+    is not a pass" message tells a reader *which* invariant it was.  A
+    bare ``IndexError`` from inside a model is not a diagnosis.
+    """
+
+
+class PositionAccountingError(AdjudicationError):
+    """A per-position input could not be aligned to ``input_ids``.
+
+    Raised when an input that must hold one entry per sequence position
+    (see :data:`PER_POSITION_INPUTS`) has a length this adapter cannot
+    reconcile with the prompt plus the teacher-forced prefix, or when an
+    unrecognised input is shaped as though it were per-position.
+    """
+
+
+class DecodeReplayUnavailable(AdjudicationError):
+    """The incremental decode path could not be replayed for this model.
+
+    Callers must degrade to a single-path (prefill-only) verdict and
+    disclose it — never treat it as agreement between paths.
+    """
 
 
 # ------------------------------------------------------------------- results
@@ -501,6 +557,62 @@ def select_positions(positions: Any,
     return tuple(sorted(picked))
 
 
+def plan_prefix_extension(companion_lengths: Any, *, prompt_length: int,
+                          prefix_length: int) -> dict[str, int]:
+    """How to extend per-position inputs for a teacher-forced prefill.
+
+    A teacher-forced prefill appends ``prefix_length`` generated tokens to
+    a ``prompt_length`` prompt.  Every input that carries one entry per
+    sequence position must be appended to in lockstep; leaving one at
+    prompt length is the defect this function exists to prevent.
+
+    **The assumption, stated rather than inferred**: the processor emits
+    ``input_ids`` in which any multimodal placeholder is ALREADY expanded
+    to one id per embedding position, so ``len(input_ids)`` equals the
+    number of KV positions and a companion of that same length is
+    per-position.  This holds for the model families in scope (their
+    processors emit the placeholder token repeated once per patch), and
+    the framework's own generation bookkeeping makes the same assumption
+    when it grows these inputs by one per generated token.  If a model
+    instead expands placeholders inside ``forward()``, a companion will
+    match neither length and this function raises rather than guessing —
+    which is the honest outcome, because an offset inferred here would
+    silently move the position being adjudicated.
+
+    ``companion_lengths`` maps input name -> current last-dim length.
+    Returns ``{name: value_to_append}`` for those needing extension;
+    names already at the target length are omitted.  Raises
+    :class:`PositionAccountingError` naming the input and both lengths
+    for anything it cannot reconcile.
+    """
+    if prompt_length < 1:
+        raise ValueError(f"prompt_length must be >= 1, got {prompt_length}")
+    if prefix_length < 0:
+        raise ValueError(f"prefix_length must be >= 0, got {prefix_length}")
+    target = prompt_length + prefix_length
+    plan: dict[str, int] = {}
+    for name in sorted(companion_lengths):
+        length = int(companion_lengths[name])
+        if length == target:
+            continue                        # already aligned, nothing to do
+        if length != prompt_length:
+            raise PositionAccountingError(
+                f"per-position input {name!r} has length {length}, which is "
+                f"neither the prompt length {prompt_length} nor the "
+                f"teacher-forced length {target} (prompt + {prefix_length} "
+                f"reference tokens): this adapter cannot tell which "
+                f"positions it describes, and guessing would move the "
+                f"position being adjudicated")
+        if name not in _APPENDED_POSITION_VALUE:
+            raise PositionAccountingError(
+                f"per-position input {name!r} sits at the prompt length "
+                f"{prompt_length} and must grow to {target}, but this "
+                f"adapter has no defined value for an appended generated "
+                f"token; refusing to invent one")
+        plan[name] = _APPENDED_POSITION_VALUE[name]
+    return plan
+
+
 def _check_fraction(value: Any) -> float:
     try:
         frac = float(value)
@@ -758,27 +870,81 @@ def adjudicate(reference_token: Any, candidate_token: Any, *,
 # thin: they produce logit rows and hand them to the core, which owns
 # every decision.
 
+def _single_sequence_length(ids: Any) -> int:
+    """Prompt length of a batch-of-one ``input_ids``; refuse otherwise."""
+    shape = getattr(ids, "shape", None)
+    if shape is None:
+        raise PositionAccountingError(
+            "inputs['input_ids'] has no shape: cannot account for positions")
+    if len(shape) != 2:
+        raise PositionAccountingError(
+            f"inputs['input_ids'] must be (batch, sequence), got shape "
+            f"{tuple(shape)}")
+    if int(shape[0]) != 1:
+        raise PositionAccountingError(
+            f"adjudication is single-sequence by construction (one reference "
+            f"and one candidate token list), but input_ids carries batch "
+            f"{int(shape[0])}")
+    return int(shape[1])
+
+
+def _companion_lengths(inputs: dict, prompt_length: int) -> dict[str, int]:
+    """Census of per-position inputs, with a guard for unrecognised ones."""
+    lengths: dict[str, int] = {}
+    for name, value in inputs.items():
+        if name == "input_ids":
+            continue
+        shape = getattr(value, "shape", None)
+        if shape is None:
+            continue
+        if len(shape) < 2:
+            continue
+        if name in PER_POSITION_INPUTS:
+            lengths[name] = int(shape[-1])
+            continue
+        if len(shape) != 2:
+            continue
+        if int(shape[0]) != 1:
+            continue
+        if int(shape[-1]) == prompt_length:
+            raise PositionAccountingError(
+                f"input {name!r} is shaped (1, {prompt_length}) so it looks "
+                f"per-position, but it is not one this adapter knows how to "
+                f"extend for a teacher-forced prefill; refusing to forward it "
+                f"unchanged, which would misalign it with input_ids")
+    return lengths
+
+
 def prefill_logit_row(model: Any, inputs: dict, prefix_token_ids) -> list[float]:
     """Teacher-forced prefill row for the position after ``prefix_token_ids``.
 
-    Runs ONE forward pass over ``inputs["input_ids"] ++ prefix_token_ids``
-    (all other entries of ``inputs`` — e.g. image tensors — are passed
-    through unchanged, and ``attention_mask`` is regrown to the new
-    length), then returns ``logits[0, -1]`` as a python float list.  This
-    is the pass the model would make if it saw the whole reference prefix
-    at once; it is *not* how the token was actually produced.
+    Runs ONE forward pass over ``inputs["input_ids"] ++ prefix_token_ids``.
+    Every per-position input is extended in lockstep (see
+    :func:`plan_prefix_extension`); everything else — image tensors, grid
+    metadata — passes through unchanged.  Returns ``logits[0, -1]`` as a
+    python float list.
+
+    This is the pass the model would make if it saw the whole reference
+    prefix at once; it is *not* how the token was actually produced,
+    which is why Rule B also measures the decode path.
     """
     import torch
 
     ids = inputs["input_ids"]
+    prompt_length = _single_sequence_length(ids)
     prefix = list(prefix_token_ids)
+    plan = plan_prefix_extension(
+        _companion_lengths(inputs, prompt_length),
+        prompt_length=prompt_length, prefix_length=len(prefix))
+
+    fwd = dict(inputs)
     if prefix:
         ext = torch.tensor([prefix], device=ids.device, dtype=ids.dtype)
-        ids = torch.cat([ids, ext], dim=1)
-    fwd = dict(inputs)
-    fwd["input_ids"] = ids
-    if "attention_mask" in fwd:
-        fwd["attention_mask"] = torch.ones_like(ids)
+        fwd["input_ids"] = torch.cat([ids, ext], dim=1)
+        for name, value in plan.items():
+            companion = fwd[name]
+            pad = companion.new_full((1, len(prefix)), value)
+            fwd[name] = torch.cat([companion, pad], dim=-1)
     with torch.inference_mode():
         out = model(**fwd)
     return out.logits[0, -1].float().tolist()
@@ -797,11 +963,25 @@ def decode_logit_rows(model: Any, inputs: dict, reference_tokens,
     requested position serves every smaller one.  That makes the cost
     ``1 + max(positions)`` forwards instead of ``sum(positions)``.
 
-    Returns ``{position: row}``.  Raises ``RuntimeError`` if the model
-    returns no KV cache (the replay would otherwise silently degenerate
-    into repeated prefills).  Callers are expected to treat any failure
-    here as "decode path unavailable" and fall back to a single-path,
-    explicitly-labelled verdict.
+    **The decode path is defined as what generation itself runs**, not as
+    a hand-rolled imitation of it.  Each step's inputs come from the
+    model's own ``prepare_inputs_for_generation`` and each step's
+    bookkeeping from its own ``_update_model_kwargs_for_generation``,
+    driven exactly the way the sampling loop drives them: the full
+    running ``input_ids`` with ``next_sequence_length=None`` and
+    ``is_first_iteration=True`` for the prompt (so multimodal tensors are
+    consumed once), then ``next_sequence_length=1`` per decode step (so
+    the model slices to the new position and grows the mask, the cache
+    and every per-position companion itself).  That removes every offset
+    this adapter would otherwise have to infer — position accounting is
+    the model's, and a row measured here is a row generation would have
+    argmaxed.
+
+    Returns ``{position: row}``.  Raises :class:`DecodeReplayUnavailable`
+    — naming what could not be reconciled — if the model does not expose
+    that contract or returns no KV cache.  Callers are expected to treat
+    any failure here as "decode path unavailable" and fall back to a
+    single-path, explicitly-labelled verdict.
     """
     import torch
 
@@ -816,35 +996,54 @@ def decode_logit_rows(model: Any, inputs: dict, reference_tokens,
             f"position {wanted[-1]} is beyond the {len(reference)}-token "
             f"reference: there is no prefix to replay")
 
+    prepare = getattr(model, "prepare_inputs_for_generation", None)
+    if prepare is None:
+        raise DecodeReplayUnavailable(
+            "model exposes no prepare_inputs_for_generation(): the decode "
+            "path it actually runs cannot be reproduced, so the dual-path "
+            "rule has nothing to compare the prefill row against")
+    update = getattr(model, "_update_model_kwargs_for_generation", None)
+    if update is None:
+        raise DecodeReplayUnavailable(
+            "model exposes no _update_model_kwargs_for_generation(): the "
+            "per-step bookkeeping (KV cache, attention mask, per-position "
+            "companions) cannot be reproduced faithfully")
+
     ids = inputs["input_ids"]
-    step = dict(inputs)
-    if "attention_mask" in step:
-        step["attention_mask"] = torch.ones_like(ids)
-    step["use_cache"] = True
+    _single_sequence_length(ids)
+    model_kwargs = {k: v for k, v in inputs.items() if k != "input_ids"}
+    model_kwargs["use_cache"] = True
+    running = ids
     rows: dict[int, list[float]] = {}
+    consumed = 0
     with torch.inference_mode():
-        out = model(**step)
-        past = getattr(out, "past_key_values", None)
-        attn = step.get("attention_mask")
-        consumed = 0
-        if consumed in wanted:
-            rows[consumed] = out.logits[0, -1].float().tolist()
-        for token in reference[:wanted[-1]]:
-            if past is None:
-                raise RuntimeError(
-                    "model returned no KV cache: the decode path cannot be "
-                    "replayed incrementally")
-            nxt = torch.tensor([[token]], device=ids.device, dtype=ids.dtype)
-            kw = {"input_ids": nxt, "past_key_values": past, "use_cache": True}
-            if attn is not None:
-                grow = torch.ones((1, 1), device=attn.device, dtype=attn.dtype)
-                attn = torch.cat([attn, grow], dim=1)
-                kw["attention_mask"] = attn
-            out = model(**kw)
-            past = getattr(out, "past_key_values", None)
-            consumed += 1
+        while True:
+            first = consumed == 0
+            try:
+                model_inputs = prepare(
+                    running, next_sequence_length=None if first else 1,
+                    is_first_iteration=first, **model_kwargs)
+            except TypeError as exc:
+                raise DecodeReplayUnavailable(
+                    f"the model's prepare_inputs_for_generation() does not "
+                    f"accept the generation-loop contract this replay drives "
+                    f"(next_sequence_length / is_first_iteration): {exc}"
+                ) from exc
+            out = model(**model_inputs)
             if consumed in wanted:
                 rows[consumed] = out.logits[0, -1].float().tolist()
+            if consumed >= wanted[-1]:
+                break
+            if getattr(out, "past_key_values", None) is None:
+                raise DecodeReplayUnavailable(
+                    "model returned no KV cache: the decode path cannot be "
+                    "replayed incrementally, so no decode-path logit row can "
+                    "be measured")
+            model_kwargs = update(out, model_kwargs, is_encoder_decoder=False)
+            nxt = torch.tensor([[reference[consumed]]], device=ids.device,
+                               dtype=ids.dtype)
+            running = torch.cat([running, nxt], dim=1)
+            consumed += 1
     return rows
 
 

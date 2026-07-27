@@ -94,17 +94,28 @@ because a scorecard that only shows wins is not evidence of a working
 verifier — it is evidence of an untested one.
 
 **Withdrawal (2026-07-27).** The VLM static-KV claim was accepted under an
-earlier rule that adjudicated a disputed token on the teacher-forced
-prefill path alone. Under the current rule — ε-optimal set **and**
-prefill/decode consistency — it could not be re-established: the token
-mismatch is still there, and the adjudicator that would decide whether it
-is arbitration or divergence crashes on that model's multimodal path. The
-status is **unproven, not disproven**; no evidence is not a pass. A
-separate finding makes the withdrawal substantive rather than procedural:
-on this runtime, requesting a static cache silently also enables a
-compiled forward, so the original measurement was of a composition nobody
-had separated, and compiled diffusion/decode is already classified as
-*bounded* by measurement.
+earlier rule that adjudicated *one* disputed token, on the teacher-forced
+prefill path, and called it a tie at gap 0.0. Re-verified under the
+current rule — ε-optimal set, prefill/decode consistency, and a census of
+disagreeing positions — it is **refused as a real divergence**: 83 of 128
+compared positions disagree (65%), with deciding gaps of 0.25, 17.75 and
+22.25 against ε=1e-3. Gaps of that size are not knife edges and 83
+disagreements are not "a single greedy flip", so the measurement does not
+merely fail to reproduce the original evidence — it contradicts its
+description.
+
+Two further findings are why this matters beyond one row. A separate
+experiment shows the static cache **alone is 0.87× — slower** — and the
+entire speedup credited to it comes from a compiled forward that
+requesting the cache silently enables; compiled decode is already
+classified *bounded* by measurement, and its drift signature is exactly
+one bf16 ULP. So the pass was very likely misnamed as well as
+mismeasured. And on a different model the strengthened rule caught a
+4.32× leg that the old prefill-only rule would have promoted as exact.
+
+Disclosed limit: the decode replay is still unavailable on that VLM, so
+its verdict rests on the prefill path alone. That weakens confidence in a
+*benign* verdict; it does not rescue gaps of this size.
 
 ## Design principles
 

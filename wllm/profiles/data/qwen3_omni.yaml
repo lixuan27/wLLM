@@ -1,29 +1,54 @@
-# Qwen3-Omni 30B-A3B — grounded in the onboarding smoke (job 202109) and
-# the AR-decode optimization sweep (job 202214) only.
+# Qwen3-Omni 30B-A3B — grounded in the onboarding smoke (job 202109), the
+# AR-decode sweep (job 202214) and the cache-vs-compile split (job 202328).
 #
 # READ THIS BEFORE CONCLUDING "NOBODY TRIED": optimizations_lossless is
-# empty because an exact-quality decode sweep RAN and every candidate was
-# REFUSED with a measured reason — not because the question was never
-# asked. The eight per-leg outcomes (2 accepted reference baselines, 6
-# rejections with reasons) are in .wllm/traces/beta.jsonl under job
-# 202214, and the per-leg evidence is below.
+# empty because exact-quality sweeps RAN and every candidate was refused
+# or left unproven — not because the question was never asked. The
+# per-leg outcomes are in .wllm/traces/beta.jsonl under jobs 202214 and
+# 202328.
 #
-# Attribution caveat that anyone re-reading the 4.3x number must keep:
-# in this runtime, requesting a static KV cache ALSO puts generate() on
-# an auto-compiled forward (the compile criterion fires for any
-# compileable non-dynamic cache), so the leg measured the COMPOSITION of
-# cache + auto-compile. Neither the speed nor the numeric drift can be
-# attributed to the cache alone; separating them is UNMEASURED and
-# therefore claimed nowhere in this file.
+# HEADLINE (job 202328) — THE 4.3x IS A MISATTRIBUTION IF CALLED A CACHE
+# WIN. Requesting a static KV cache also puts generate() on an
+# auto-compiled forward (the compile criterion fires for any compileable
+# non-dynamic cache; default config is inductor with reduce-overhead,
+# i.e. CUDA graphs). Suppressing that compile — proven by two independent
+# signals, not by trusting a kwarg name — decomposes the speedup exactly:
+#     static KV cache ALONE      0.873x @64, 0.876x @256  (SLOWER by ~13%)
+#     compiled forward           4.719x @64
+#     composition                4.117x @64
+#     0.873 * 4.719 = 4.1175 vs composition 4.1173 — closes to 5e-4
+# So the entire gain belongs to the compiled forward, which the registry
+# already classifies as BOUNDED quality by prior measurement. The
+# component named "static_kv_cache" is, on this runtime, a ~13 percent
+# REGRESSION whose only other effect is to trigger the compile.
 #
-# Second caveat, same class: the runtime swaps the routed-expert kernel
-# from grouped_mm to batched_mm for the DECODE phase only and restores it
-# afterwards. So the config value below describes prefill; the reference
-# leg and the batched_mm leg decoded with the same kernel, which is why
-# that leg measured 1.00x with byte-identical tokens.
+# TWO THINGS THIS FILE DELIBERATELY DOES NOT CLAIM:
+# 1. The compiled path is NOT recorded as an exact win, even though the
+#    trace store holds an accepted row for static_cache_autocompile at
+#    64 tokens (4.117x, byte-identical tokens). That row is contradicted
+#    by job 202214, where the SAME configuration diverged at 57 of 64
+#    positions. The two runs differ in that 202214 omitted the CUDA-graph
+#    step marker, so its tokens could have been read from reused graph
+#    memory; that makes 202214's divergence suspect as a harness artifact
+#    AND leaves the compiled path's output stability unreproduced across
+#    processes. Unstable-across-runs is not exact.
+# 2. Cache-alone exactness is established only at 64 tokens (tokens
+#    byte-identical to the reference). At 256 tokens the verifier raised
+#    inside the harness, so quality there is UNMEASURED, not refused.
 #
-# Tier stays "launchable": nothing was promoted, so nothing here claims
-# more than "the thinker text path runs end-to-end and was measured".
+# Second attribution caveat, unchanged: the runtime swaps the routed-
+# expert kernel grouped_mm to batched_mm for the DECODE phase only and
+# restores it after, so the config value describes prefill. That is why
+# the batched_mm leg measured 1.00x with byte-identical tokens.
+#
+# SCOPE: measured on this 30B-A3B MoE thinker on 1xH200. The auto-compile
+# mechanism lives in the framework generate() and so is generic, but
+# these MAGNITUDES are not transferable — a dense model has a different
+# launch-overhead-to-compute ratio than a sparse 30B-A3B whose batch-1
+# decode is launch-bound. What generalizes is the mechanism and the
+# misattribution risk; the numbers do not.
+#
+# Tier stays "launchable": nothing was promoted.
 model_family: qwen3-omni
 detection_ids:
   - Qwen/Qwen3-Omni-30B-A3B-Instruct
@@ -41,44 +66,48 @@ runtime_support:
                 UNMEASURED and not claimed here"}
       - {kind: job_log, ref: "job 202214",
          note: "AR decode sweep, single load, 80-token prompt, forced
-                greedy lengths (min_new_tokens == max_new_tokens) so no
-                leg can win by stopping early. REFERENCE LEG (declared
-                bf16, dynamic cache, config experts grouped_mm, attn
-                sdpa): 2640 ms / 24.25 tok/s at 64 new tokens and
-                9906 ms / 25.84 tok/s at 256, peak VRAM 59.3GB, median
-                of 3 timed reps after a warmup. This reproduces the
-                202109 smoke to within 0.2 percent."}
-      - {kind: job_log, ref: "job 202214",
-         note: "NO EXACT WIN FOUND — the measured attempt and its
-                refusals. static KV cache: 4.47x at 64 tokens and 4.32x
-                at 256 (590/2296 ms, up to 111 tok/s), authenticity
-                confirmed by the realized cache class StaticCache, but
-                REFUSED by the token-parity gate — at 64 tokens both
-                adjudication paths agree on real_divergence (decisive
-                logit gap 0.125 against epsilon 1e-3, with 57 of 64
-                positions disagreeing), and at 256 the prefill and
-                decode paths disagree (benign_tie vs real_divergence),
-                which the dual-path rule returns as undecidable. The
-                0.125 gaps are one bf16 ULP at that logit magnitude,
-                i.e. genuine reordering drift, consistent with this
-                leg running an auto-compiled forward. routed-expert
-                kernel batched_mm: exact (identical at 64, adjudicated
-                benign_tie at 256) but 1.003x / 0.984x, i.e. no benefit,
-                and +5.5GB peak VRAM — it only changes prefill, since
-                the runtime already decodes with that kernel. eager:
-                REFUSED, real_divergence at both lengths, and 0.34x
-                (2.9x SLOWER). No combined leg was run because no
-                expert kernel cleared the 1.05x bar."}
-optimizations_lossless: []   # measured empty (job 202214), not untried
-optimizations_bounded: []    # nothing here has a measured quality budget
+                greedy lengths. Reference leg (declared bf16, dynamic
+                cache): 2640 ms / 24.25 tok/s at 64 new tokens and
+                9906 ms / 25.84 tok/s at 256, peak VRAM 59.3GB. Routed-
+                expert kernel batched_mm was exact but 1.003x / 0.984x
+                and +5.5GB peak, because it only changes prefill; eager
+                was refused and 0.34x. KNOWN DEFECT of this run: it
+                omitted the CUDA-graph step marker, so the token
+                divergence it recorded for the static-cache leg may be a
+                harness artifact rather than model numerics."}
+      - {kind: job_log, ref: "job 202328",
+         note: "cache-vs-compile split, single load, same prompt and
+                forced lengths as 202214. Auto-compile suppression was
+                PROVEN by two signals (no compiled callable was built,
+                and the compiler counters did not move). Static KV cache
+                ALONE: 2803 ms at 64 tokens and 11059 ms at 256, i.e.
+                0.873x and 0.876x — SLOWER than the uncompiled dynamic-
+                cache reference (2446 ms / 9692 ms), with tokens
+                byte-identical to the reference at 64 tokens and quality
+                UNMEASURED at 256 (the verifier raised inside the
+                harness). Compiled forward alone: 4.719x. Composition:
+                4.117x, and the decomposition multiplies back to within
+                5e-4. Conclusion: the speedup is entirely the compiled
+                forward, whose quality class is bounded, and the cache
+                component is a ~13 percent regression. The 256-token
+                compiled leg REFUSED TO LABEL ITSELF because it could not
+                observe compilation, and is recorded as failed rather
+                than as a number."}
+optimizations_lossless: []   # measured empty (jobs 202214, 202328)
+optimizations_bounded: []    # the compile that wins here has no measured
+                             # quality budget on this model, and its
+                             # output stability is unreproduced
 incompatibilities: []
 authenticity_signals:
   - path_notes_recorded
   - cache_class_recorded
   - experts_impl_recorded
+  - compiled_callable_built_recorded
+  - compiler_counter_delta_recorded
 validation:
   - fixed_prompt_greedy_smoke
   - decode_token_parity_dual_path
+  - autocompile_suppression_proven
 binding:
   backend_version: "0.0.1a0"
   hardware: 1xH200

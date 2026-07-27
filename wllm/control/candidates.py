@@ -183,8 +183,13 @@ def plan_candidates(model_id: str, *, hardware: str, context: dict,
         spec = CandidateSpec(backend=cap.backend, passes=kept,
                              support=support, provenance=provenance)
         if trace_store is not None:
+            # workload comes from the context when the caller stated one;
+            # without it the store deliberately answers conservatively,
+            # because an acceptance measured on one workload is not
+            # evidence about another
+            workload = context.get("workload")
             bad = trace_store.known_bad(model_id, hardware,
-                                        spec.candidate_key)
+                                        spec.candidate_key, workload)
             if bad is not None:
                 report.rejected[cap.backend] = (
                     f"known-bad from trace {bad.trace_id} "
@@ -195,7 +200,8 @@ def plan_candidates(model_id: str, *, hardware: str, context: dict,
             for p in spec.passes:
                 pbad = trace_store.known_bad(
                     model_id, hardware, {"pass": p, "gpus":
-                                         context.get("num_gpus", 1)})
+                                         context.get("num_gpus", 1)},
+                    workload)
                 if pbad is not None:
                     provenance.append(
                         f"dropped pass {p!r}: known-bad from trace "

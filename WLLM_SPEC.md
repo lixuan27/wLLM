@@ -186,6 +186,20 @@ WM(action-to-first-state/rollout steps/s/branch 吞吐) · WAM(o→a p50-95-99/d
      - **已声明的适用边界**：首位置之后的裁决是拿**参考前缀** teacher-force 的——序列一旦分叉，
        候选自身的条件就不同了，所以那些位置是**反事实检查**：能否决候选，但不能单独证明候选
        实际轨迹最优。此不对称正是分歧比例封顶存在的理由，并写入结果的 `notes`。
+   - **双路规则以"该模型家族的 decode 重放确实可用"为前提**（M27-E 增补）。decode 行不是手写
+     模仿，而是**由模型自身的 generation 输入准备驱动**（逐步 `prepare_inputs_for_generation` +
+     `_update_model_kwargs_for_generation`，首步 `is_first_iteration=True / next_sequence_length=None`
+     消费多模态张量，其后每步 `next_sequence_length=1`）——位置账目归模型所有，本模块不臆造任何 offset。
+     若模型不提供该契约、不返回 KV cache，或 per-position 输入无法对齐，适配器抛**带类型、带描述**的
+     `DecodeReplayUnavailable` / `PositionAccountingError`（禁止让模型内部的裸 `IndexError` 冒出来充当诊断），
+     此时**结论退化为单路（prefill）并在 `notes` 中如实声明**——单路是旧的、更弱的规则，
+     **绝不可记为"两路一致"**。
+   - **前缀 teacher-force 的位置账目**（同上）：processor 已把视觉占位符展开为"每个 embedding 位置
+     一个 id"，因此 `len(input_ids) == KV 位置数`；凡与 `input_ids` 等长的 per-position 输入
+     （`attention_mask` / `mm_token_type_ids` / `token_type_ids` / `position_ids`）在拼接参考前缀时
+     **必须同步延长**（新增位置：mask=1、mm 类型=0 即纯文本），漏掉任何一个都会在模型内部炸成
+     "mask [N] vs indexed tensor [prompt]"。该清单与填充值取自框架自身的 generation 记账，非本模块臆断；
+     无法对齐者一律 raise 并同时报出输入名与两个长度。
    - `undecidable` 是与 `real_divergence` 并列的**一等结论**：它说的是"本次测量什么都
      证明不了"，调用方必须按拒绝处理。输入缺失/退化（空 logit 行、越界 token id、非有限值、
      位置越界、无任何被检位置）一律 raise 或 `undecidable`，**永远不会是 `benign_tie`**。

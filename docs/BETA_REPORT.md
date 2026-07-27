@@ -29,13 +29,24 @@ project promised: no blanket "supported".
 | Qwen3-VL-8B | 2668 ms /128 tok | static KV cache | ~~**2.75×**~~ | ~~tie-aware exact~~ **WITHDRAWN 2026-07-27 — see correction** |
 | OpenVLA-7B | 133 ms /action (naive fp32) | native bf16 | **4.59×** | native-precision restoration (ckpt declares bf16) |
 
-> **Correction, 2026-07-27 (jobs 202244, 202214).** The Qwen3-VL row is
-> withdrawn. It was accepted under an adjudication rule that ruled on the
-> teacher-forced **prefill** path alone; the current rule also replays the
-> **decode** path and refuses when the two disagree. Re-verification could
-> not re-establish the claim, because the adjudicator crashes on this
-> model's multimodal path — so the status is **unproven, not disproven**,
-> and this project's rule is that no evidence is not a pass.
+> **Correction, 2026-07-27 (jobs 202244, 202503, 202214, 202328).** The
+> Qwen3-VL row is withdrawn, and the final verdict is **refused as a real
+> divergence**, not merely unproven: a census finds **83 of 128 compared
+> positions disagree (65%)** with deciding gaps of 0.25, 17.75 and 22.25
+> against ε=1e-3. The acceptance described "a single greedy flip at a
+> top-2 gap of exactly 0.0"; the current measurement contradicts that
+> description rather than merely failing to reproduce it. (A first attempt
+> could not rule at all — the adjudicator crashed on this model's
+> multimodal path — which is why the claim was briefly recorded as
+> unproven.) Disclosed limit: the decode replay is still unavailable on
+> this model, so the verdict rests on the prefill path alone; that
+> weakens a *benign* verdict, not gaps of this size.
+>
+> The separation experiment (job 202328) then showed the static cache
+> **alone is 0.87× — slower** — with the whole speedup belonging to a
+> compiled forward that requesting the cache silently enables. So the
+> pass was misnamed as well as mismeasured: what was catalogued as an
+> exact optimization is a slowdown plus a bounded-quality compile.
 >
 > Two findings from the same week explain why this matters beyond one row.
 > First, on a different model the strengthened rule caught a **4.32×** leg

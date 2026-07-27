@@ -1,32 +1,120 @@
-# Cosmos3-Nano — grounded in the onboarding smoke (job 200596) only.
-# No optimization is claimed yet; this profile records what actually ran.
+# Cosmos3-Nano — grounded in the onboarding smoke (job 200596) and the
+# safety-chain A/B (job 202327). No optimization is claimed; this
+# profile records what actually ran and what it cost.
 model_family: cosmos3-nano
 detection_ids:
   - nvidia/Cosmos3-Nano
   - "nvidia/Cosmos3-Nano*"
-components: [reasoner, generator, vae, sound_decoder, action_head]
+components: [reasoner, generator, vae, sound_decoder, action_head,
+             safety_checker]
 runtime_support:
   - runtime: torch-local
     tier: launchable
     evidence:
       - {kind: job_log, ref: "job 200596",
-         note: "fixed-seed T2I smoke: load 21.7s, median 48.8s at 20
-                steps 480x832, peak VRAM 35.5GB; full call signature
-                introspected (video/sound/action knobs). BLOCKER on
-                record: official safety-checker weights are gated
-                pending account license approval; smoke used the
-                pipeline's official opt-out knob, loudly logged —
-                guardrail restoration precedes any serving claim"}
+         note: "fixed-seed text2world smoke with the safety chain
+                DISABLED: load 21.7s, 48.8s at 20 steps 480x832, peak
+                VRAM 35.5GB; full call signature introspected. That
+                number is a lower bound only — see job 202327 for the
+                guarded cost a deployment must actually quote"}
+      - {kind: job_log, ref: "job 202327",
+         note: "safety chain RESTORED and measured. Same prompt/seed/
+                steps, one process, arms interleaved after a discarded
+                warmup, 2 reps. Unguarded 45079ms -> guarded 48647ms =
+                +3568ms (7.9%). Stage split: prompt check 1110ms (413ms
+                compute + 697ms device transfer), frame check 2471ms
+                (1526ms detection + ~945ms format conversion and
+                transfer). Attribution closes to -13ms, 0.37% of the
+                delta unexplained. Guardrail load 2.7s, separate from
+                the 20.9s pipeline load. Peak VRAM unchanged at 35.5GB:
+                the chain is CPU-resident between checks, so its
+                transient residency never exceeds the generation peak"}
+      - {kind: job_log, ref: "job 202327",
+         note: "what this checker version actually constructs:
+                Blocklist (1813 terms), Qwen3Guard (0.6B prompt guard),
+                RetinaFaceFilter (frame postprocessor). The Aegis /
+                LlamaGuard-7b weights and the SigLIP video content
+                safety filter present in the guardrail tree are NOT
+                loaded on this version — VideoContentSafetyFilter is
+                disabled upstream — so they contribute nothing to these
+                numbers and nothing here evidences them"}
+      - {kind: job_log, ref: "job 202327",
+         note: "the chain demonstrably refuses as well as admits: empty
+                input refused, 5 of 5 terms drawn from the shipped
+                blocklist refused, and the prompt guard did not fail
+                open (it swallows its own exceptions and returns safe,
+                so this was checked explicitly). Benign control prompt
+                passed 2/2 requests and guarded frames are
+                bit-identical to the unguarded arm, max_abs_diff 0 over
+                189 frames — on this prompt the chain admits the
+                request and leaves the output alone. One prompt on one
+                workload; not a claim about the chain in general"}
+      - {kind: job_log, ref: "job 202327",
+         note: "PROVENANCE, hand-verified: the guardrail cache was
+                reconstructed by hand, not produced by a clean
+                download. nvidia/Cosmos-1.0-Guardrail revision
+                cf03c0395fac8c4de386c0bdab12cc4fc8d66362; its refs/main
+                needed repair — a trailing newline made the revision
+                unresolvable offline and failed job 202227.
+                Qwen/Qwen3Guard-Gen-0.6B revision
+                fada3b2f655b89601929198343c94cd2f64d93cc came from the
+                publishing organization's mirror, NOT from HuggingFace,
+                verified per file by exact byte size against the
+                upstream manifest plus a safetensors header parse"}
 optimizations_lossless: []
 optimizations_bounded: []
 incompatibilities: []
 authenticity_signals:
   - pipeline_call_signature_introspected
+  - guardrail_empty_input_refused
+  - guardrail_blocklist_probes_refused_5_of_5
+  - guardrail_prompt_guard_did_not_fail_open
+  - guardrail_frames_bit_identical_to_unguarded_arm
+  - guardrail_overhead_attribution_closes_to_0p37pct
 validation:
   - fixed_seed_smoke
+  - guardrail_ab_fixed_seed
 binding:
   backend_version: "0.0.1a0"
   hardware: 1xH200
   cuda: ""
-  last_validated: "2026-07-26"
+  last_validated: "2026-07-27"
   evidence_level: measured
+
+# ---------------------------------------------------------------------
+# OPEN QUESTION — hypothesis, not a claim. Kept deliberately outside the
+# machine-readable fields above so no planner can consume it as fact.
+#
+# MEASURED (job 202327): of the 3568ms the safety chain adds, roughly
+# 1939ms is safety computation (413ms prompt guard + ~1526ms face
+# detection) and roughly 1642ms is data movement and format churn
+# (697ms moving the same guard weights onto the device and back on
+# EVERY request, plus ~945ms of PIL->uint8->PIL round-tripping inside
+# the frame stage). Nearly half the cost of the guardrail is therefore
+# not guarding. That decomposition is measured; everything below is not.
+#
+# HYPOTHESIS (unmeasured): the chain is a separable component of the
+# request graph — the prompt check reads only the prompt, the frame
+# check only decoded frames, so neither consumes a generation
+# intermediate. Two distinct ideas follow, with different ceilings:
+#   * Residency. The 697ms transfer moves the SAME weights every
+#     request. Keeping them resident would remove it outright. This is
+#     not an overlap question at all, and is the cheaper and more
+#     certain of the two; it costs ~2.5GB VRAM this workload has spare.
+#   * Overlap. The serial parts are bounded by real data dependencies:
+#     the prompt check must clear before output is returned, so
+#     overlapping it with generation means speculating on work a
+#     refusal would discard; and the frame check cannot begin before
+#     frames exist, though it could in principle be pipelined against
+#     progressive VAE decode rather than waiting for all 189 frames.
+#     On a single GPU the guard's own compute contends for the same
+#     SMs as generation, so overlap is not free there — a clean win
+#     would need separate hardware or a separate guard service.
+# The ceiling on all of it together is the measured 3568ms (7.9%), an
+# upper bound on what an experiment could possibly find, not a result.
+# Nothing was implemented and nothing was measured. Note also that this
+# overhead sits BELOW the 10% significance threshold that
+# wllm.control.guardrail applies: the tooling itself declined to flag
+# it (significant=false in the job's accounting). It is recorded here
+# as an open question, not as a finding.
+# ---------------------------------------------------------------------

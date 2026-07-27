@@ -131,6 +131,15 @@ def main() -> int:  # noqa: C901 — one linear sweep, kept in one place
         cache pass: a pass that silently did not engage must not be
         allowed to report a speedup.
         """
+        # REQUIRED, and its absence in the job 202214 run is a known
+        # defect of that run: requesting a static cache silently puts
+        # generate() on a `reduce-overhead` (CUDA-graph) compiled forward,
+        # whose output tensors live in graph-managed memory and can be
+        # overwritten by a later replay. Without marking the step, tokens
+        # read back from an earlier call can be clobbered -- which is a
+        # plausible cause of the token divergence 202214 attributed to
+        # the model's numerics. See the profile note.
+        torch.compiler.cudagraph_mark_step_begin()
         kw = dict(inputs)
         kw.update(do_sample=False,
                   thinker_max_new_tokens=n_new,

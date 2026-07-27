@@ -11,21 +11,28 @@ hand-tuned deployments.
 > match later knowledge stops being evidence of anything. Read the row,
 > then read this.
 >
-> The 2.75× `static KV cache` result was accepted as *tie-aware exact*
-> under a rule that adjudicated the disputed token on the teacher-forced
-> **prefill** path alone. Under the current rule — ε-optimal set **and**
-> prefill/decode consistency — it could not be re-established (job
-> 202244): the token mismatch is still there, and the adjudicator that
-> would decide arbitration-vs-divergence **crashes** on this model's
-> multimodal path. Status: **unproven, not disproven**; no evidence is
-> not a pass.
+> **UPDATE, job 202503: the claim is now DISPROVEN, not merely unproven.**
+> A position census refuses it as a real divergence — 83 of 128 positions
+> disagree (65%), deciding gaps 0.25/17.75/22.25 against ε=1e-3. The
+> original description ("a single greedy flip at gap 0.0") is contradicted,
+> not merely unreproduced.
 >
-> A second finding (job 202214, on a different model) makes the
-> withdrawal substantive rather than procedural: on this runtime,
-> requesting a static cache **silently also enables a compiled forward**,
-> so a leg labelled "static KV cache" measures a composition — and
-> compiled decode is already classified *bounded* by measurement, with
-> drift of exactly one bf16 ULP. The separation experiment is running.
+> How it got there, in order. The 2.75× `static KV cache` result was
+> accepted as *tie-aware exact* under a rule that adjudicated **one**
+> disputed token on the teacher-forced **prefill** path. Job 202244 could
+> not re-adjudicate it at all — the adjudicator crashed on this model's
+> multimodal path — so the claim came out as *unproven*, on the rule that
+> no evidence is not a pass. Job 202503, with the adjudicator repaired
+> and ruling on a census, refused it outright as above.
+>
+> Two further findings explain why the original number looked the way it
+> did. On this runtime, requesting a static cache **silently also enables
+> a compiled forward**, so a leg labelled "static KV cache" measures a
+> composition; and the separation experiment (job 202328) shows the cache
+> **alone is 0.87× — slower** — with the entire speedup belonging to the
+> compiled forward, which is already classified *bounded* by measurement
+> and whose drift signature is exactly one bf16 ULP. The pass was very
+> likely misnamed as well as mismeasured.
 >
 > Consequence for the headline: with this row withdrawn, the "median
 > 2.75× across three models" sentence below no longer has three

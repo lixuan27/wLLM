@@ -12,9 +12,30 @@ modalities:
   input: [text, image, video, audio]
   output: [text, image, video, audio]
 passes:
+  # Split out of a single "static_kv_cache: exact, 2.75x" entry on
+  # 2026-07-27. That entry conflated two components whose signs are
+  # OPPOSITE: the layout change is a small regression, and the compile it
+  # silently drags in carries the entire gain and the entire quality
+  # risk. A renamed or annotated single pass would have kept hiding that,
+  # and a planner under an exact policy would have kept selecting its way
+  # to a compiled forward — which is how the withdrawn VLM claim happened.
   static_kv_cache:
     quality: exact
-    notes: measured 2.75x on the 8B VLM with a tie-aware exact verdict
+    notes: layout only. Measured 0.873x/0.876x on a 30B-A3B MoE thinker
+      (job 202328) — a REGRESSION on its own, token-identical where
+      checked. Any speedup credited to this pass must be re-derived with
+      compilation suppressed, because on this runtime requesting it also
+      enables auto_compiled_decode.
+  auto_compiled_decode:
+    quality: bounded
+    requires: {compileable_cache: true}
+    conflicts: [cuda_graph_capture]
+    notes: auto-enabled by the generation loop for any compileable
+      non-dynamic cache (inductor + reduce-overhead, i.e. CUDA graphs).
+      Carries the whole measured gain (4.719x at 64 tokens, job 202328)
+      and the whole quality risk; its output stability across processes
+      is UNREPRODUCED, and a harness that omits a cudagraph step marker
+      can read clobbered tokens (job 202214 is suspect for this reason).
   cfg_branch_parallel:
     quality: exact
     requires: {min_num_gpus: 2, model_uses_cfg: true}

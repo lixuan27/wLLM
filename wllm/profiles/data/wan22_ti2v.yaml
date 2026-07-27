@@ -33,6 +33,26 @@ optimizations_bounded:
          note: "1.43x single-GPU but frame drift mean 7.4/255; refused by
                 the exact gate — that refusal IS the bounded evidence"}
     notes: "bf16 fusion reordering drifts diffusion trajectories"
+  - name: reuse_cache
+    quality_class: bounded
+    evidence:
+      - {kind: job_log, ref: "job 202354",
+         note: "50-step schedule, output-stability key, threshold 0.10,
+                consecutive cap 2: 1.38x (9831 -> 7142 ms) reusing 14 of
+                50 model evaluations, PSNR 32.0 dB against a declared
+                30 dB budget, max_abs 229/255. The budget was declared in
+                code before the run, not fitted to it"}
+      - {kind: job_log, ref: "jobs 202206 and 202264",
+         note: "the same technique has NO operating point at 20 steps:
+                keying on input movement engages early and collapses the
+                video (3.31x at PSNR 11.6 dB, refused), and the
+                output-stability key never engages at all. Applicability
+                is a schedule-length property — the observed per-step
+                relative move starts at 0.009 over 50 steps versus 0.022
+                over 20, so the finer schedule is what creates the
+                redundancy this technique consumes"}
+    notes: "only the output-stability key is admissible; keying on input
+            movement is measured to engage exactly where reuse is unsafe"
 # The batched-CFG divergence (max_abs 251/255) is recorded where it is
 # enforceable: as a rejected optimization trace (see the trace seeds)
 # and by cfg_batched's absence from the runtime's pass registry.

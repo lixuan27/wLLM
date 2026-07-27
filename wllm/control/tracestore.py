@@ -205,7 +205,7 @@ class TraceStore:
         return {k: sorted(v) for k, v in sorted(pat.items())}
 
     def known_bad(self, model: str, hardware: str,
-                  candidate: dict) -> Trace | None:
+                  candidate: dict, workload: str | None = None) -> Trace | None:
         """Latest matching trace, returned only if it is bad.
 
         Matching is *subset* semantics: every key in ``candidate`` must
@@ -214,19 +214,40 @@ class TraceStore:
         is what lets a planner probe with ``{"pass": ..., "gpus": ...}``
         and still hit richer recorded configs.
 
-        Rehabilitation: the LATEST matching trace (append order) wins —
-        if a config was rejected once and later re-measured as
-        accepted, this returns ``None``; a rejection is evidence, not a
-        life sentence.
+        Rehabilitation: within ONE workload the latest matching trace
+        wins — a config rejected once and later re-measured as accepted
+        returns ``None``, because a rejection is evidence, not a life
+        sentence.
+
+        Rehabilitation does NOT cross workloads. Pass ``workload`` and
+        the answer is confined to that workload's evidence. Omit it and
+        the rule depends on whether omitting it was ambiguous at all:
+        when every matching trace belongs to one workload there is
+        nothing to confuse, so latest-wins applies as usual; when the
+        matches span several workloads the store cannot tell which
+        evidence the caller meant, and a rejection anywhere outweighs an
+        acceptance elsewhere.
+
+        Discovered by dogfood: a reuse cache accepted on a 50-step
+        schedule would otherwise have silently cleared itself on a
+        20-step one, where the same pass is measured to destroy the
+        output. An acceptance on one workload says nothing about safety
+        on another — the same reason this project treats absent evidence
+        as a refusal rather than a pass.
         """
-        for t in reversed(self._traces):
-            if t.model != model or t.hardware != hardware:
-                continue
-            if not isinstance(t.candidate, dict):
-                continue
-            if all(t.candidate.get(k) == v for k, v in candidate.items()):
-                return t if t.status in _NEEDS_REASON else None
-        return None
+        matches = [t for t in self._traces
+                   if t.model == model and t.hardware == hardware
+                   and isinstance(t.candidate, dict)
+                   and (workload is None or t.workload == workload)
+                   and all(t.candidate.get(k) == v
+                           for k, v in candidate.items())]
+        if not matches:
+            return None
+        if workload is not None or len({t.workload for t in matches}) == 1:
+            last = matches[-1]
+            return last if last.status in _NEEDS_REASON else None
+        bad = [t for t in matches if t.status in _NEEDS_REASON]
+        return bad[-1] if bad else None
 
 
 # --------------------------------------------------------------- seeds
@@ -368,16 +389,71 @@ def beta_seed_traces() -> list[Trace]:
               workload="AR decode, 128 new tokens",
               candidate={"pass": "static_kv_cache", "gpus": 1},
               status="rejected",
-              reason="claim withdrawn as UNPROVEN, not disproven: the "
-                     "greedy mismatch persists (pos 43, ref 3691 vs "
-                     "6303) and the adjudicator that would rule it "
-                     "arbitration-or-divergence crashed on the "
-                     "multimodal path (mask 263 vs indexed tensor 220 — "
-                     "vision placeholder expansion desynchronizes the "
-                     "decode replay); no evidence is not a pass",
-              metrics={"speedup_unverified": 2.75, "baseline_ms": 2683.5},
-              evidence="job 202244 "
-                       "(logs/wllm_qwen3vl_dualpath_202244.out)",
+              reason="claim DISPROVEN under a position census: 83 of "
+                     "128 compared positions disagree (64.8%), verdict "
+                     "real_divergence with deciding gaps 0.25/17.75/"
+                     "22.25 against epsilon 1e-3 — not the 'single "
+                     "greedy flip at gap 0.0' the acceptance described. "
+                     "Caveat: the decode replay is unavailable on this "
+                     "model, so the verdict rests on the prefill path "
+                     "alone; that weakens a benign verdict, not gaps of "
+                     "this size",
+              metrics={"speedup_unverified": 2.75, "baseline_ms": 2683.5,
+                       "positions_disagreeing": 83,
+                       "positions_compared": 128,
+                       "max_deciding_gap": 22.25},
+              evidence="jobs 202244 (adjudicator crashed -> unproven) "
+                       "and 202503 "
+                       "(logs/wllm_qwen3vl_dualpath_retry1_202503.out, "
+                       "ruled real_divergence)",
+              recorded="2026-07-27"),
+        # job 202354: the reuse cache's operating point, found only after
+        # two rounds of refusal. The corpus needs this row as much as it
+        # needs the refusals — a store that only remembers failures would
+        # teach a planner that the technique is worthless, when what is
+        # actually true is that its applicability depends on schedule
+        # length.
+        Trace(model=wan, hardware="1xH200", runtime="torch-local",
+              workload="t2v 33f@480x832, 50 denoise steps",
+              candidate={"pass": "reuse_cache", "site": "model_evaluation",
+                         "key": "output", "threshold": 0.1,
+                         "consecutive_cap": 2, "gpus": 1},
+              status="accepted",
+              reason="bounded: 1.38x reusing 14 of 50 model evaluations, "
+                     "PSNR 32.0 dB against a 30 dB budget declared before "
+                     "the run; the output-stability key engages only once "
+                     "the function is observed to settle, which a 50-step "
+                     "schedule permits and a 20-step one does not",
+              metrics={"speedup": 1.38, "psnr_db": 32.0,
+                       "max_abs_255": 229, "steps_reused": 14,
+                       "steps_total": 50},
+              evidence="job 202354 "
+                       "(logs/wllm_stepcache_wan22_v3_50step_202354.out)",
+              recorded="2026-07-27"),
+        # job 202328 supersedes two rows that job's own sbatch wrote, on
+        # the measuring engineer's report: the compiled leg was recorded
+        # accepted-and-exact, but its tokens are unreproduced across
+        # processes (a harness missing a cudagraph step marker can read
+        # clobbered output), and the 256-token cache-alone row was
+        # recorded as a quality rejection when the harness had actually
+        # raised. A refusal manufactured from a harness bug is the same
+        # class of error as a manufactured win.
+        Trace(model="Qwen/Qwen3-Omni-30B-A3B-Instruct", hardware="1xH200",
+              runtime="torch-local",
+              workload="thinker AR decode, 64 new tokens",
+              candidate={"pass": "auto_compiled_decode", "gpus": 1},
+              status="rejected",
+              reason="4.719x is real but its OUTPUT is unreproduced: the "
+                     "same configuration produced byte-identical tokens "
+                     "in one job and 57-of-64 disagreement in another, "
+                     "and the differing job omitted a cudagraph step "
+                     "marker, so it may have read clobbered memory. "
+                     "Neither exact nor inexact is established; an "
+                     "optimization whose output depends on the harness "
+                     "is not promotable either way",
+              metrics={"speedup": 4.719, "cache_only_speedup": 0.873},
+              evidence="jobs 202328 and 202214 "
+                       "(logs/wllm_qwen3omni_cachesplit_202328.out)",
               recorded="2026-07-27"),
     ]
 

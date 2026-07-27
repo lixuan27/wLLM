@@ -91,8 +91,7 @@ def main() -> int:  # noqa: C901 — one linear experiment, kept in one place
     from transformers import AutoProcessor, Qwen3OmniMoeForConditionalGeneration
 
     from wllm.verify.adjudicate import (
-        BENIGN_TIE, IDENTICAL, TOKEN_MISMATCH, adjudicate_generation,
-        first_divergence,
+        IDENTICAL, TOKEN_MISMATCH, adjudicate_generation, first_divergence,
     )
 
     # Signal (B). Imported defensively: if this build does not expose the
@@ -177,11 +176,17 @@ def main() -> int:  # noqa: C901 — one linear experiment, kept in one place
                     "detail": div.reason, "divergence": div.as_dict()}
         adj = adjudicate_generation(thinker, adj_inputs, ref, got,
                                     epsilon=TIE_GAP_EPS)
-        return {"exact": adj.verdict == BENIGN_TIE, "kind": adj.verdict,
-                "n_mismatch": n_mismatch, "dual_path": adj.dual_path,
-                "detail": (f"{adj.reason} [{n_mismatch} of {len(ref)} "
-                           f"positions disagree; the verifier rules on "
-                           f"the first]"),
+        # The shared verifier now returns a whole-generation verdict with a
+        # census (Rule C), so the census is what gets reported: how many
+        # disagreeing positions were actually measured, and how many were
+        # not. `is_benign` is the only thing that counts as exact.
+        return {"exact": adj.is_benign, "kind": adj.verdict,
+                "n_mismatch": n_mismatch,
+                "positions_compared": adj.positions_compared,
+                "positions_disagreeing": adj.positions_disagreeing,
+                "positions_examined": len(adj.positions_examined),
+                "positions_unexamined": adj.positions_unexamined,
+                "detail": adj.summary(),
                 "adjudication": adj.as_dict()}
 
     # Ordered deliberately: the compiled-callable attribute is sticky, so
@@ -316,9 +321,23 @@ def main() -> int:  # noqa: C901 — one linear experiment, kept in one place
         try:
             row["exactness"] = check_exact(ref, tokens[(row["leg"], n)])
         except Exception as exc:  # noqa: BLE001
-            row["exactness"] = {"exact": False, "n_mismatch": None,
-                                "kind": "adjudication_failed",
+            # A CRASH IN THE VERIFIER IS NOT A QUALITY VERDICT. Mapping it
+            # onto "not exact" would manufacture a refusal out of a harness
+            # bug, which is the same class of error as manufacturing a win:
+            # both report a conclusion no measurement supports. The leg
+            # becomes a failure whose quality is explicitly UNMEASURED.
+            row.update(status="failed",
+                       reason=(f"quality UNMEASURED: the verifier raised "
+                               f"{type(exc).__name__}: {exc}. This is a "
+                               f"harness fault, not evidence about the "
+                               f"candidate; the timing on this leg stands "
+                               f"but no exactness claim is made either way"))
+            row["exactness"] = {"exact": None, "n_mismatch": None,
+                                "kind": "unmeasured",
                                 "detail": f"{type(exc).__name__}: {exc}"}
+            print(f"[gate {row['leg']} n={n}] UNMEASURED (verifier fault) "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            continue
         print(f"[gate {row['leg']} n={n}] "
               f"{'EXACT' if row['exactness']['exact'] else 'REFUSED'} "
               f"({row['exactness']['kind']}) {row['exactness']['detail']}",
