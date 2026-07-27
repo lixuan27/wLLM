@@ -231,7 +231,7 @@ class TraceStore:
 
 # --------------------------------------------------------------- seeds
 def beta_seed_traces() -> list[Trace]:
-    """The six measured Alpha/Beta outcomes, verbatim from the reports.
+    """The measured Alpha/Beta outcomes, verbatim from the reports.
 
     Every number below is copied from docs/ALPHA_REPORT.md or
     docs/BETA_REPORT.md (each citing its real SLURM job); nothing here
@@ -337,6 +337,26 @@ def beta_seed_traces() -> list[Trace]:
               evidence="jobs 195638 -> 195701; docs/ALPHA_REPORT.md "
                        "scorecard; docs/BETA_REPORT.md verifier law 3",
               recorded="2026-07-24"),
+        # job 202206: the reuse cache's first measurement on a real
+        # diffusion loop. Every threshold was refused on quality even
+        # though the fastest was 3.30x, so the corpus carries a *fast
+        # and wrong* candidate — the case a speed-only planner would
+        # happily promote.
+        Trace(model=wan, hardware="1xH200", runtime="torch-local",
+              workload=wan_load,
+              candidate={"pass": "reuse_cache", "site": "model_evaluation",
+                         "key": "input", "gpus": 1},
+              status="rejected",
+              reason="quality collapse: keying reuse on latent movement "
+                     "engages early, where the latent is still near-noise "
+                     "(small relative move) but the velocity field is "
+                     "least stable and fixes global structure — "
+                     "PSNR 11.6-11.7 dB at every threshold tried",
+              metrics={"speedup": 3.30, "psnr_db": 11.6,
+                       "max_abs_255": 255, "steps_reused": 14,
+                       "steps_total": 20},
+              evidence="job 202206 (logs/wllm_stepcache_wan22_202206.out)",
+              recorded="2026-07-27"),
     ]
 
 

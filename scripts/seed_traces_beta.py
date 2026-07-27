@@ -1,4 +1,4 @@
-"""Seed .wllm/traces/beta.jsonl with the six measured Beta outcomes.
+"""Seed .wllm/traces/beta.jsonl with the measured Beta outcomes.
 
 Thin CLI over ``wllm.control.tracestore.seed_beta_traces`` — the seed
 data lives next to the store so tests exercise the exact same function

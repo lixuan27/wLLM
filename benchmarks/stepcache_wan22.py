@@ -38,6 +38,16 @@ NEG = "low quality, blurry, distorted"
 H, W, FRAMES, STEPS, SEED, CFG = 480, 832, 33, 20, 1234, 5.0
 THRESHOLDS = [float(x) for x in
               os.environ.get("WLLM_STEPCACHE_TAUS", "0.05,0.10,0.20").split(",")]
+# (key, threshold, consecutive cap) triples.  Round 1 (job 202206) swept
+# the input key alone and every leg was refused on quality: keying on
+# latent movement engages early, where the latent is still near-noise
+# (so its *relative* move is small) but the velocity field is least
+# stable and sets the video's global structure.  Round 2 adds the
+# output-stability key, which cannot engage until the function itself
+# has been seen to settle, plus a tighter consecutive cap to bound drift.
+LEGS = [("input", tau, 4) for tau in THRESHOLDS] + \
+       [("output", tau, cap)
+        for tau, cap in ((0.02, 2), (0.05, 2), (0.10, 2), (0.05, 1))]
 REPS = 2
 # declared bounded-quality budget for this technique on this workload;
 # a leg outside it is reported as rejected, not quietly accepted
@@ -99,8 +109,9 @@ def main() -> int:
         video = vae.decode(z, return_dict=False)[0]
         return ((video.float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8)
 
-    def timed(threshold: float):
-        cache = TensorOutputReuseCache(step_fn=predict, threshold=threshold)
+    def timed(threshold: float, key: str = "input", cap: int = 4):
+        cache = TensorOutputReuseCache(step_fn=predict, threshold=threshold,
+                                        key=key, max_consecutive_reuses=cap)
         lat = denoise(cache)                     # warmup (also fills caches)
         torch.cuda.synchronize()
         times = []
@@ -122,9 +133,9 @@ def main() -> int:
                  "status": "reference",
                  "observed_deltas": [round(d, 5) for d in ref_cache.deltas]})
 
-    for tau in THRESHOLDS:
+    for key, tau, cap in LEGS:
         try:
-            lat, ms, times, cache = timed(tau)
+            lat, ms, times, cache = timed(tau, key, cap)
             frames = decode(lat)
             diff = (frames.float() - ref_frames.float()).abs()
             max_abs = diff.max().item()
@@ -146,22 +157,24 @@ def main() -> int:
                 status, reason = "rejected", (
                     f"quality outside declared budget: PSNR {psnr:.1f}dB < "
                     f"{PSNR_BUDGET_DB}dB, max_abs {max_abs:.0f}/255")
-            legs.append({"leg": f"cache_tau{tau}", "threshold": tau,
+            legs.append({"leg": f"cache_{key}_tau{tau}_cap{cap}", "key": key,
+                         "threshold": tau, "consecutive_cap": cap,
                          "median_ms": ms, "times_ms": times,
                          "steps_total": cache.steps_total,
                          "steps_reused": reused,
                          "speedup": round(ref_ms / ms, 4),
                          "max_abs_255": max_abs, "psnr_db": round(psnr, 2),
                          "status": status, "reason": reason})
-            print(f"[leg tau={tau}] {ms:.1f}ms ({ref_ms/ms:.2f}x) "
-                  f"reused={reused}/{cache.steps_total} psnr={psnr:.1f}dB "
-                  f"-> {status}: {reason}", flush=True)
+            print(f"[leg key={key} tau={tau} cap={cap}] {ms:.1f}ms "
+                  f"({ref_ms/ms:.2f}x) reused={reused}/{cache.steps_total} "
+                  f"psnr={psnr:.1f}dB -> {status}: {reason}", flush=True)
         except Exception as exc:   # one leg must not abort the sweep
-            legs.append({"leg": f"cache_tau{tau}", "threshold": tau,
+            legs.append({"leg": f"cache_{key}_tau{tau}_cap{cap}", "key": key,
+                         "threshold": tau, "consecutive_cap": cap,
                          "status": "failed", "reason":
                          f"{type(exc).__name__}: {exc}"})
-            print(f"[leg tau={tau}] FAILED {type(exc).__name__}: {exc}",
-                  flush=True)
+            print(f"[leg key={key} tau={tau}] FAILED "
+                  f"{type(exc).__name__}: {exc}", flush=True)
 
     summary = {"model": "Wan-AI/Wan2.2-TI2V-5B", "technique": "reuse_cache",
                "cache_site": "model_evaluation", "workload":

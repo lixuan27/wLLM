@@ -26,6 +26,11 @@ passes:
   cuda_graph_capture:
     quality: exact
     requires: {static_shapes: true}
+  reuse_cache:
+    quality: bounded
+    notes: skips model evaluations inside an iterative loop; engagement
+      must be proven (zero reuses means the pass did nothing) and the
+      reuse key decides whether it is safe at all (measured)
   async_output_materialization:
     quality: exact
   layerwise_offload:

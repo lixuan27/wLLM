@@ -187,6 +187,106 @@ def test_authenticity_and_deltas_are_reported():
     assert abs(cache.deltas[0] - 0.5) < 1e-6
 
 
+def test_output_key_waits_for_two_real_evaluations():
+    """The output key cannot judge stability it has not observed twice."""
+    n_calls = []
+    cache = TensorOutputReuseCache(
+        step_fn=lambda x, k: (n_calls.append(k) or torch.ones(4)),
+        threshold=1.0, key="output")
+    x = torch.ones(4)
+    cache(x, 0)                     # first evaluation: nothing to compare
+    assert cache.steps_reused == 0
+    cache(x, 1)                     # second: still no prior *move* known
+    assert cache.steps_reused == 0 and n_calls == [0, 1]
+    cache(x, 2)                     # now the function is known to be flat
+    assert cache.steps_reused == 1 and n_calls == [0, 1]
+
+
+def test_output_key_ignores_a_still_input_when_the_output_moves():
+    """The whole point: a quiet input must not license reuse.
+
+    The input never changes here, so the input key would reuse forever;
+    the output key sees the function's value jumping and refuses.
+    """
+    outs = iter([torch.zeros(4), torch.full((4, ), 100.0),
+                 torch.zeros(4), torch.full((4, ), 100.0)])
+    n_calls = []
+    cache = TensorOutputReuseCache(
+        step_fn=lambda x, k: (n_calls.append(k) or next(outs)),
+        threshold=0.1, key="output")
+    x = torch.ones(4)
+    for k in range(4):
+        cache(x, k)
+    assert cache.steps_reused == 0, cache.deltas
+    assert n_calls == [0, 1, 2, 3]
+
+
+def test_input_key_would_reuse_where_the_output_key_refuses():
+    """Same trace, opposite verdicts — the keys are not interchangeable."""
+    outs = iter([torch.zeros(4), torch.full((4,), 100.0),
+                 torch.zeros(4), torch.full((4,), 100.0)])
+    n_calls = []
+    cache = TensorOutputReuseCache(
+        step_fn=lambda x, k: (n_calls.append(k) or next(outs)),
+        threshold=0.1, key="input")
+    x = torch.ones(4)
+    for k in range(4):
+        cache(x, k)
+    assert cache.steps_reused > 0 and len(n_calls) < 4
+
+
+def test_defaults_are_the_conservative_ones():
+    """A cache built with no arguments must be inert and bounded.
+
+    Defaults are a safety contract, not cosmetics: a technique that
+    engages before anyone asked for it would silently change results in
+    every pipeline that constructs one without thinking.
+    """
+    n_calls = []
+    for cls in (TensorOutputReuseCache, TensorStepResidualCache):
+        n_calls.clear()
+        cache = cls(step_fn=lambda x, k: (n_calls.append(k) or x * 2.0))
+        x = torch.ones(4)
+        for k in range(4):
+            cache(x, k)
+        assert cache.steps_reused == 0, f"{cls.__name__} reuses by default"
+        assert n_calls == [0, 1, 2, 3]
+        assert cache.key == "input"          # the cheap key is the default
+        assert cache.max_consecutive_reuses == 4
+
+    # and the default cap really is the cap: with reuse always allowed,
+    # every 5th step is a forced recomputation
+    n_calls.clear()
+    capped = TensorOutputReuseCache(
+        step_fn=lambda x, k: (n_calls.append(k) or x * 2.0), threshold=1.0)
+    x = torch.ones(4)
+    for k in range(11):
+        capped(x, k)
+    assert n_calls == [0, 5, 10], n_calls
+
+
+def test_reference_backend_defaults_match_the_tensor_backend():
+    """The two backends must not disagree on their default contract."""
+    calls = []
+    ref = StepResidualCache(step_fn=lambda x, k: (calls.append(k)
+                                                  or [v * 2 for v in x]))
+    for k in range(4):
+        ref([1.0, 1.0], k)
+    assert ref.steps_reused == 0 and calls == [0, 1, 2, 3]
+    assert ref.max_consecutive_reuses == 4
+    assert ref.threshold == TensorOutputReuseCache(
+        step_fn=lambda x, k: x).threshold
+
+
+def test_unknown_key_is_rejected():
+    try:
+        TensorOutputReuseCache(step_fn=lambda x, k: x, key="vibes")
+    except ValueError as exc:
+        assert "key must be one of" in str(exc)
+    else:
+        raise AssertionError("unknown reuse keys must be rejected")
+
+
 def test_invalid_construction_is_rejected():
     for kwargs in ({"threshold": -0.1}, {"max_consecutive_reuses": 0}):
         try:

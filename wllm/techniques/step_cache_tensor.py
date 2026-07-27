@@ -42,11 +42,27 @@ from .step_cache import should_reuse
 
 @dataclass
 class _TensorReuseCacheBase:
-    """Shared state, evidence and engagement rule for both backends."""
+    """Shared state, evidence and engagement rule for both backends.
+
+    ``key`` selects *which* signal the reuse rule is applied to, and the
+    choice is load-bearing rather than cosmetic:
+
+    ``"input"``
+        Reuse while the loop's input is barely moving.  Cheap, but it is
+        a proxy: an input can move slowly while the expensive function's
+        value moves fast, and then the cache engages in exactly the
+        phase where reuse is least safe.
+    ``"output"``
+        Reuse while the *function's own value* is barely moving, judged
+        between its last two genuine evaluations.  Self-correcting — the
+        moment the output starts changing, reuse stops — at the cost of
+        needing two real evaluations before it can engage at all.
+    """
 
     step_fn: Callable[[Any, int], Any]
     threshold: float = 0.0
     max_consecutive_reuses: int = 4
+    key: str = "input"
     steps_total: int = 0
     steps_reused: int = 0
     # per-step relative input deltas actually observed; this is the
@@ -56,38 +72,61 @@ class _TensorReuseCacheBase:
     _consecutive: int = field(default=0, repr=False)
     _last_input: Any = field(default=None, repr=False)
     _cached: Any = field(default=None, repr=False)
+    _prev_eval: Any = field(default=None, repr=False)
+    _out_move: tuple | None = field(default=None, repr=False)
+
+    KEYS = ("input", "output")
 
     def __post_init__(self):
         if self.threshold < 0:
             raise ValueError("threshold must be >= 0")
         if self.max_consecutive_reuses < 1:
             raise ValueError("max_consecutive_reuses must be >= 1")
+        if self.key not in self.KEYS:
+            raise ValueError(f"key must be one of {self.KEYS}, got {self.key!r}")
 
     def reset(self) -> None:
         """Per-request reset of cache state AND evidence counters."""
         self._last_input = None
         self._cached = None
+        self._prev_eval = None
+        self._out_move = None
         self._consecutive = 0
         self.steps_total = 0
         self.steps_reused = 0
         self.deltas = []
 
-    def _engages(self, x) -> bool:
-        """Measure the input's relative move and apply the shared rule.
+    @staticmethod
+    def _relative_move(a, b) -> tuple:
+        """``(||a - b||, ||b||)`` in float32, whatever the working dtype.
 
-        Norms are taken in float32 whatever the working dtype: a bf16
-        norm over a large latent loses enough mantissa to make the
-        decision itself noisy.
+        A bf16 norm over a large tensor loses enough mantissa to make
+        the reuse decision itself noisy, so the norms are always widened.
         """
         import torch
 
         with torch.no_grad():
-            delta = torch.linalg.vector_norm(
-                (x - self._last_input).float()).item()
-            base = torch.linalg.vector_norm(self._last_input.float()).item()
+            return (torch.linalg.vector_norm((a - b).float()).item(),
+                    torch.linalg.vector_norm(b.float()).item())
+
+    def _engages(self, x) -> bool:
+        """Apply the shared rule to whichever signal ``key`` selects."""
+        if self.key == "input":
+            delta, base = self._relative_move(x, self._last_input)
+        else:
+            if self._out_move is None:
+                return False      # not two genuine evaluations yet
+            delta, base = self._out_move
         self.deltas.append(delta / (base + 1e-12))
         return should_reuse(delta, base, self.threshold, self._consecutive,
                             self.max_consecutive_reuses)
+
+    def _record_evaluation(self, out) -> None:
+        """Remember how far the function's value moved since last time."""
+        if self.key == "output":
+            if self._prev_eval is not None:
+                self._out_move = self._relative_move(out, self._prev_eval)
+            self._prev_eval = out.clone()
 
     def authenticity(self) -> dict[str, float]:
         """Evidence the orchestrator checks before believing a win.
@@ -109,7 +148,10 @@ class TensorStepResidualCache(_TensorReuseCacheBase):
 
     def __call__(self, x, k: int):
         self.steps_total += 1
-        if self._last_input is not None and self._cached is not None:
+        # one guard, not two: _cached and _last_input are written in the
+        # same tail below, so testing both would be a condition no test
+        # could ever exercise independently
+        if self._cached is not None:
             if self._engages(x):
                 self.steps_reused += 1
                 self._consecutive += 1
@@ -117,6 +159,7 @@ class TensorStepResidualCache(_TensorReuseCacheBase):
                 self._last_input = x.clone()
                 return out
         out = self.step_fn(x, k)
+        self._record_evaluation(out)
         self._cached = (out - x).clone()
         self._last_input = x.clone()
         self._consecutive = 0
@@ -133,13 +176,17 @@ class TensorOutputReuseCache(_TensorReuseCacheBase):
 
     def __call__(self, x, k: int):
         self.steps_total += 1
-        if self._last_input is not None and self._cached is not None:
+        # one guard, not two: _cached and _last_input are written in the
+        # same tail below, so testing both would be a condition no test
+        # could ever exercise independently
+        if self._cached is not None:
             if self._engages(x):
                 self.steps_reused += 1
                 self._consecutive += 1
                 self._last_input = x.clone()
                 return self._cached
         out = self.step_fn(x, k)
+        self._record_evaluation(out)
         self._cached = out.clone()
         self._last_input = x.clone()
         self._consecutive = 0

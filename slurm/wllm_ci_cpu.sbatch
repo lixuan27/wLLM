@@ -46,6 +46,33 @@ python scripts/receipt_wan22_cfgpar.py || FAIL=1
 step "optimization trace seed (idempotent, real beta outcomes)"
 python scripts/seed_traces_beta.py || FAIL=1
 
+step "measured failure prunes a candidate (three-source planner loop)"
+# The reuse cache was measured at 3.30x on this exact model and refused
+# on quality (job 202206).  A planner scoring on speed alone would
+# promote it; ours must drop it and cite the trace.
+#
+# Two independent layers must hold, and the first would mask the second:
+#   1. under the default exact policy the pass never even reaches
+#      history, because a bounded-quality pass is illegal outright;
+#   2. under a bounded-allowing policy — where the pass IS legal and
+#      genuinely tempting — measured history is the thing that stops it.
+# Asserting only (1) would let (2) rot silently, so both are checked.
+CAND="python -m wllm.control.cli candidates . --model Wan-AI/Wan2.2-TI2V-5B \
+  --hardware 1xH200 --num-gpus 1 --traces .wllm/traces/beta.jsonl \
+  --today $(date +%F)"
+$CAND > /tmp/wllm_cand_exact_$SLURM_JOB_ID.txt 2>&1
+grep -q "reject wllm-serving:reuse_cache: quality=bounded" \
+  /tmp/wllm_cand_exact_$SLURM_JOB_ID.txt \
+  && echo "  layer 1 (quality policy): bounded pass refused — PASS" \
+  || { echo "  layer 1: reuse_cache not refused under exact policy — FAIL"; \
+       cat /tmp/wllm_cand_exact_$SLURM_JOB_ID.txt; FAIL=1; }
+$CAND --quality-policy bounded > /tmp/wllm_cand_b_$SLURM_JOB_ID.txt 2>&1
+grep -q "dropped pass 'reuse_cache'" /tmp/wllm_cand_b_$SLURM_JOB_ID.txt \
+  && grep -q "quality collapse" /tmp/wllm_cand_b_$SLURM_JOB_ID.txt \
+  && echo "  layer 2 (measured history): reuse_cache dropped citing its trace — PASS" \
+  || { echo "  layer 2: reuse_cache survived measured history — FAIL"; \
+       cat /tmp/wllm_cand_b_$SLURM_JOB_ID.txt; FAIL=1; }
+
 step "mutation smoke (kill rate >= 80%)"
 python scripts/mutation_smoke.py --threshold 0.8 || FAIL=1
 

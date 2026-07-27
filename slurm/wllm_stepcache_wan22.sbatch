@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=wllm_stepcache_wan22
+#SBATCH --job-name=wllm_stepcache_wan22_v2
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:1
 #SBATCH --mem=200G
-#SBATCH --time=01:00:00
+#SBATCH --time=01:30:00
 #SBATCH --exclude=server13,server59
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
@@ -47,12 +47,13 @@ for leg in summary["legs"]:
         model=summary["model"], hardware="1xH200", runtime="torch-local",
         workload=summary["workload"],
         candidate={"pass": "reuse_cache", "site": summary["cache_site"],
-                   "threshold": leg["threshold"], "gpus": 1},
+                   "threshold": leg["threshold"], "key": leg.get("key", "input"),
+                   "consecutive_cap": leg.get("consecutive_cap"), "gpus": 1},
         status=status, reason=leg["reason"], metrics=metrics,
         evidence=f"job {os.environ['WLLM_SC_JOB']} ({files[-1]})",
         recorded=os.environ["WLLM_SC_TODAY"]))
     written += 1
-    print(f"  {status:8s} tau={leg['threshold']} id={tid} :: {leg['reason']}")
+    print(f"  {status:8s} {leg['leg']} id={tid} :: {leg['reason']}")
 print(f"stepcache traces written: {written}")
 PYEOF
 

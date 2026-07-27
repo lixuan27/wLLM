@@ -226,27 +226,33 @@ def test_seed_beta_traces_idempotent():
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "beta.jsonl"
         st = TraceStore(path)
-        assert seed_beta_traces(st) == 6
-        assert len(st.all()) == 6
+        assert seed_beta_traces(st) == 7
+        assert len(st.all()) == 7
         assert seed_beta_traces(st) == 0    # second run adds nothing
-        assert st.deduped == 6
+        assert st.deduped == 7
         st2 = TraceStore(path)              # fresh load, same result
-        assert st2.corrupt_lines == 0 and len(st2.all()) == 6
+        assert st2.corrupt_lines == 0 and len(st2.all()) == 7
         assert seed_beta_traces(st2) == 0
         lines = [x for x in path.read_text().splitlines() if x.strip()]
-        assert len(lines) == 6
+        assert len(lines) == 7
 
 
 def test_seed_content_matches_reports():
     seeds = beta_seed_traces()
-    assert len(seeds) == 6
+    assert len(seeds) == 7
     for t in seeds:
         assert t.validate() == [], t
         assert t.evidence, "every seed must point at real evidence"
-        assert t.recorded in ("2026-07-24", "2026-07-25")
+        assert t.recorded in ("2026-07-24", "2026-07-25", "2026-07-27")
     accepted = [t for t in seeds if t.status == "accepted"]
     rejected = [t for t in seeds if t.status == "rejected"]
-    assert len(accepted) == 3 and len(rejected) == 3
+    assert len(accepted) == 3 and len(rejected) == 4
+    # the corpus must contain at least one candidate that was FAST and
+    # refused anyway; without such a row a speed-only planner would look
+    # indistinguishable from ours on this evidence
+    fast_and_wrong = [t for t in rejected
+                      if t.metrics.get("speedup", 0) > 1.5]
+    assert fast_and_wrong, "seed corpus lacks a fast-but-refused candidate"
     with tempfile.TemporaryDirectory() as td:
         st = TraceStore(Path(td) / "b.jsonl")
         seed_beta_traces(st)
@@ -267,11 +273,12 @@ def test_seed_content_matches_reports():
         bad = st.known_bad("Wan-AI/Wan2.2-TI2V-5B", "1xH200",
                            {"pass": "cfg_batched", "gpus": 1})
         assert bad is not None and "251/255" in bad.reason
-        # failure patterns cover exactly the three rejected passes
+        # failure patterns cover exactly the rejected passes
         pat = st.failure_patterns()
         assert set(pat) == {"cfg_batched",
                             "torch_compile_max_autotune",
-                            "torch_compile_reduce_overhead"}
+                            "torch_compile_reduce_overhead",
+                            "reuse_cache"}
         for reasons in pat.values():
             assert all(r.strip() for r in reasons)
 
